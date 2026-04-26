@@ -53,7 +53,18 @@ pub struct ServeCommand {
 }
 
 impl ServeCommand {
+    /// Run the OSS serve flow with no extra request filters.
     pub fn execute(self) -> anyhow::Result<()> {
+        self.execute_with_filters(Vec::new())
+    }
+
+    /// Run the serve flow, registering downstream-supplied request filters
+    /// (e.g. EE network policy). OSS callers pass an empty vec; external
+    /// binaries (e.g. `temps-ee`) construct their filters and pass them here.
+    pub fn execute_with_filters(
+        self,
+        request_filters: Vec<Arc<dyn temps_proxy::ProxyRequestFilter>>,
+    ) -> anyhow::Result<()> {
         // Install the rustls crypto provider once at startup. Both temps-domains
         // and check-if-email-exists try to install it themselves — calling it here
         // first satisfies the library's internal Once guard and prevents panics.
@@ -284,6 +295,7 @@ impl ServeCommand {
             serve_config.clone(),
             self.disable_https_redirect,
             on_demand_manager,
+            request_filters,
         )
     }
 }

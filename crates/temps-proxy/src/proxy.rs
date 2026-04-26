@@ -404,6 +404,7 @@ pub struct LoadBalancer {
     on_demand_manager: Option<Arc<OnDemandManager>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
     preview_auth_limiter: Arc<PreviewAuthLimiter>,
+    request_filters: Vec<Arc<dyn ProxyRequestFilter>>,
 }
 
 impl LoadBalancer {
@@ -436,12 +437,23 @@ impl LoadBalancer {
             on_demand_manager: None,
             file_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
+            request_filters: Vec::new(),
         }
     }
 
     /// Set the file store for path-keyed static asset serving.
     pub fn with_file_store(mut self, store: Arc<dyn temps_file_store::FileStore>) -> Self {
         self.file_store = Some(store);
+        self
+    }
+
+    /// Register project-scoped request filters.
+    ///
+    /// Filters run after project context resolution and short-circuit on the
+    /// first `Deny`. OSS ships with no filters; downstream binaries (e.g.
+    /// `temps-ee`) register implementations here.
+    pub fn with_request_filters(mut self, filters: Vec<Arc<dyn ProxyRequestFilter>>) -> Self {
+        self.request_filters = filters;
         self
     }
 
@@ -2725,6 +2737,50 @@ impl ProxyHttp for LoadBalancer {
             // Record activity for on-demand idle tracking
             if let Some(ref on_demand) = self.on_demand_manager {
                 on_demand.record_activity(project_ctx.environment.id);
+            }
+
+            // Run downstream-registered request filters (e.g. EE network policy).
+            // Filters see the resolved project and decide allow/deny. The first
+            // deny wins. Filter errors fail open — we do not lock operators out
+            // of their projects when a policy backend has a transient hiccup.
+            if !self.request_filters.is_empty() {
+                let parsed_client_ip: Option<std::net::IpAddr> =
+                    ctx.ip_address.as_deref().and_then(|s| s.parse().ok());
+
+                for filter in &self.request_filters {
+                    let decision = filter
+                        .check(crate::FilterContext {
+                            client_ip: parsed_client_ip,
+                            host: &ctx.host,
+                            path: &ctx.path,
+                            project: project_ctx,
+                        })
+                        .await;
+
+                    if let crate::FilterDecision::Deny { status, reason } = decision {
+                        warn!(
+                            project_id = project_ctx.project.id,
+                            filter = filter.name(),
+                            client_ip = ctx.ip_address.as_deref().unwrap_or("unknown"),
+                            reason = reason,
+                            "Request denied by proxy filter"
+                        );
+                        ctx.routing_status = "filter_denied".to_string();
+
+                        let mut response = ResponseHeader::build(status, None)?;
+                        response.insert_header("Content-Type", "text/plain")?;
+                        response.insert_header("X-Request-ID", &ctx.request_id)?;
+                        response.insert_header("X-Denied-By", filter.name())?;
+
+                        session
+                            .write_response_header(Box::new(response), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(Bytes::from(reason)), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                }
             }
 
             // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode

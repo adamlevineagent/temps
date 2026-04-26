@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+pub use pingora::http::StatusCode;
 use pingora_core::{upstreams::peer::HttpPeer, Result as PingoraResult};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::{deployments, environments, projects};
@@ -239,6 +241,72 @@ pub trait SessionManager: Send + Sync {
 
     /// Get session cookie configuration
     fn get_session_cookie_config(&self) -> &CookieConfig;
+}
+
+/// Decision returned by a [`ProxyRequestFilter`].
+///
+/// Filters short-circuit the request pipeline: the first `Deny` wins, and the
+/// proxy emits the configured status code without invoking upstream selection.
+#[derive(Debug, Clone)]
+pub enum FilterDecision {
+    /// Allow the request to proceed to the next filter (or upstream selection
+    /// if this was the last filter).
+    Allow,
+    /// Reject the request with the given HTTP status and a short reason that
+    /// is logged but not exposed to the client body.
+    Deny {
+        status: StatusCode,
+        reason: &'static str,
+    },
+}
+
+/// Context passed to a [`ProxyRequestFilter`].
+///
+/// All fields are populated *after* project context resolution but *before*
+/// upstream peer selection, so filters can make project-aware allow/deny
+/// decisions.
+#[derive(Debug, Clone)]
+pub struct FilterContext<'a> {
+    /// Resolved client IP. May be `None` when the proxy could not determine
+    /// the address (e.g. unix socket); filters should treat `None` as
+    /// "unknown" and allow.
+    pub client_ip: Option<IpAddr>,
+    /// HTTP `Host` header for the request.
+    pub host: &'a str,
+    /// Request path (no query string).
+    pub path: &'a str,
+    /// Resolved project context. Always `Some` when this hook fires.
+    pub project: &'a ProjectContext,
+}
+
+/// Hook for project-scoped allow/deny decisions on inbound requests.
+///
+/// Implementations run *after* the proxy has resolved the request to a
+/// project, environment, and deployment, but *before* upstream peer
+/// selection. They are the right layer for per-project network policy
+/// (e.g. CIDR allowlists), per-project geo-blocking, or any other
+/// "should this request reach this project at all" check that needs the
+/// project ID.
+///
+/// Filters are invoked in registration order and short-circuit on the first
+/// `Deny`. They MUST be cheap — typically an in-memory cache lookup keyed by
+/// `project.id` — because they run on every request.
+///
+/// OSS ships with no implementations. External binaries (e.g. `temps-ee`)
+/// register filters via `LoadBalancer::with_request_filters`.
+#[async_trait]
+pub trait ProxyRequestFilter: Send + Sync {
+    /// Check whether a request should be allowed. Errors are treated as
+    /// `Allow` by the caller — fail-open is the right default for network
+    /// policy because failing closed could lock operators out of their own
+    /// projects when the policy backend has a transient hiccup.
+    async fn check(&self, ctx: FilterContext<'_>) -> FilterDecision;
+
+    /// Human-readable name used in log messages when this filter denies a
+    /// request. Defaults to the type name; override for clarity.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 }
 
 /// Error types for proxy services

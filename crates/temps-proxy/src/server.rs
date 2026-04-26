@@ -208,6 +208,7 @@ pub fn setup_proxy_server(
     shutdown_signal: Box<dyn ProxyShutdownSignal>,
     config: Arc<ServerConfig>,
     on_demand_manager: Option<Arc<crate::on_demand::OnDemandManager>>,
+    request_filters: Vec<Arc<dyn ProxyRequestFilter>>,
 ) -> Result<()> {
     // Setup plugin system (async operation in sync context)
     let context = tokio::runtime::Runtime::new()?
@@ -279,7 +280,8 @@ pub fn setup_proxy_server(
         ip_access_control_service,
         challenge_service,
         proxy_config.disable_https_redirect,
-    );
+    )
+    .with_request_filters(request_filters);
 
     // Wire up on-demand scale-to-zero if OnDemandManager was created
     if let Some(ref on_demand_manager) = on_demand_manager {
