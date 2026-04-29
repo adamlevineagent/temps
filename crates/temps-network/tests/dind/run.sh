@@ -140,6 +140,24 @@ log "kernel integration tests passed in $NODE_A"
 # ---------------------------------------------------------------------------
 log "running cross-host scenario (bootstrap both, ping across)"
 
+# Step 4's full test suite on node A finishes by tearing everything down (each
+# test's Cleanup Drop guard, plus the last test's explicit remove_network),
+# so node A also needs a fresh bootstrap_only here before we can attach
+# containers to `temps-overlay`.
+docker exec \
+  -e TEMPS_IT_LOCAL_NAME=node-a \
+  -e TEMPS_IT_LOCAL_CIDR=172.20.1.0/24 \
+  -e TEMPS_IT_LOCAL_BRIDGE_IP=172.20.1.1 \
+  -e TEMPS_IT_LOCAL_UNDERLAY="$NODE_A_IP" \
+  -e TEMPS_IT_PEER_CIDR=172.20.2.0/24 \
+  -e TEMPS_IT_PEER_UNDERLAY="$NODE_B_IP" \
+  -e TEMPS_RUN_DIND_TESTS=1 \
+  "$NODE_A" sh -c '
+    cd /workspace
+    export PATH=/root/.cargo/bin:$PATH
+    cargo test -p temps-network --features integration_kernel --test it_kernel bootstrap_only -- --test-threads=1 --nocapture
+  ' || fail "node-a bootstrap failed"
+
 # Bootstrap node B with peer pointing to node A.
 docker exec \
   -e TEMPS_IT_LOCAL_NAME=node-b \

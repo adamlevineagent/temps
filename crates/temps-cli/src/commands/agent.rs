@@ -108,16 +108,13 @@ impl AgentCommand {
 
             tracing::info!("Starting temps agent (node_id={})...", config.node_id);
 
-            // Internal-zone route store (Option 1 sync). Hydrated from
-            // disk so the agent serves correctly across restarts even
-            // when the CP is briefly unreachable. The sync client below
-            // long-polls the CP and applies snapshots into this store;
-            // the internal edge proxy reads from it on every request.
-            let route_snapshot_path = agent_data_dir().join("routes").join("snapshot.json");
-            let route_store = Arc::new(temps_agent::route_store::RouteStore::new(
-                route_snapshot_path,
-            ));
-            route_store.load_from_disk();
+            // Internal-zone route store. The agent is stateless —
+            // routes live only in memory and are populated by the
+            // long-poll sync client below. A restarted agent boots
+            // empty and serves 404s from the internal proxy until the
+            // first sync round completes (typically <1s after the
+            // first request to the CP).
+            let route_store = Arc::new(temps_agent::route_store::RouteStore::new());
 
             // Spawn the long-poll sync client. Shutdown is wired to the
             // global notifier passed below; if the agent server exits,

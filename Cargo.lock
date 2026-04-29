@@ -10749,7 +10749,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "sysinfo 0.29.11",
- "tempfile",
  "temps-core",
  "temps-deployer",
  "temps-dns-resolver",

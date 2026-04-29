@@ -509,10 +509,22 @@ async fn bootstrap_only() {
     // testing using the bootstrapped state.
     let env = Env::from_env();
     cleanup_all().await;
-    let mgr = NetworkManager::new(env.config()).expect("manager new");
-    mgr.bootstrap(env.alloc(), vec![env.peer()])
+    let cfg = env.config();
+    let alloc = env.alloc();
+    let mgr = NetworkManager::new(cfg.clone()).expect("manager new");
+    mgr.bootstrap(alloc.clone(), vec![env.peer()])
         .await
         .expect("bootstrap_only");
+
+    // The runner script attaches containers to `temps-overlay` directly, so
+    // we also need the Docker network registered on top of the kernel
+    // bridge. Without this, `docker run --network temps-overlay` fails with
+    // "network temps-overlay not found".
+    let docker = bollard::Docker::connect_with_local_defaults().expect("docker connect");
+    temps_network::docker::ensure_network(&docker, &cfg, &alloc)
+        .await
+        .expect("ensure docker network");
+
     // Give the kernel a moment to settle FDB / route additions.
     tokio::time::sleep(Duration::from_millis(200)).await;
 }

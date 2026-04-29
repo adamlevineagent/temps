@@ -4,8 +4,9 @@
 //! Same shape as `temps-dns-resolver::sync_client`: one tokio task,
 //! `since=current_generation`, the CP holds the request open until a
 //! reload happens or its long-poll deadline fires, the client
-//! `apply_snapshot`s the result and then ACKs. Restart-resilient via
-//! the disk snapshot in [`RouteStore::load_from_disk`].
+//! `apply_snapshot`s the result and then ACKs. The agent is
+//! intentionally stateless — a restarted agent starts with an empty
+//! store and converges via the first sync round (typically <1s).
 //!
 //! ## Backoff
 //!
