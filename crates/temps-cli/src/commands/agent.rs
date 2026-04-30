@@ -61,20 +61,25 @@ impl AgentCommand {
             let docker = bollard::Docker::connect_with_defaults()
                 .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
 
-            let network_name = temps_core::NETWORK_NAME.clone();
-            // Overlay network is always opted into on agents — the runtime
-            // silently skips the dual-attach when the overlay isn't yet
-            // bootstrapped (single-host clusters, or before the network
-            // sync loop has run for the first time). Operators who really
-            // need to disable can override via TEMPS_OVERLAY_NETWORK="".
+            // The agent's primary Docker network is the overlay (`temps0`).
+            // The CP's legacy `temps-app-network` is a single-host artifact
+            // owned by the control-plane host; workers don't have it and
+            // shouldn't. Every container the agent creates is born on the
+            // overlay so it has a routable cross-node IP from the start —
+            // no dual-attach round-trip, no chance of a "network not found"
+            // 404 because the operator forgot to pre-create something.
             //
-            // The default must match the network name `temps-network`
-            // actually creates (`NetworkConfig::default().docker_network_name`),
-            // which is `temps0`. The previous default `temps-overlay`
-            // never matched any real network on the worker so app
-            // containers were silently single-host attached.
+            // `TEMPS_OVERLAY_NETWORK=""` opts out for diagnostic single-host
+            // setups; in that mode we fall back to `TEMPS_NETWORK_NAME`
+            // (the legacy CP-side name) so an operator who hand-created
+            // `temps-app-network` for testing still gets a working agent.
             let overlay_network = std::env::var("TEMPS_OVERLAY_NETWORK")
                 .unwrap_or_else(|_| temps_network::NetworkConfig::default().docker_network_name);
+            let network_name = if overlay_network.is_empty() {
+                temps_core::NETWORK_NAME.clone()
+            } else {
+                overlay_network.clone()
+            };
             // Shared peer-list slot. The agent's network_sync loop
             // refreshes it on every poll; both the deployer (for app
             // containers) and the agent's service handlers (for

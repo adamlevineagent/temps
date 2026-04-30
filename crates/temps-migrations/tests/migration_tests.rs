@@ -411,6 +411,8 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
         "service_endpoints",
         "node_dns_state",
         "dns_generation",
+        // m20260429_000001_add_dns_endpoint_tombstones
+        "dns_endpoint_tombstones",
     ];
 
     for table in tables {

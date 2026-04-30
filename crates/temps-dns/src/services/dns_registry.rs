@@ -41,7 +41,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use temps_core::DBDateTime;
-use temps_entities::{node_dns_state, service_endpoints};
+use temps_entities::{dns_endpoint_tombstones, node_dns_state, service_endpoints};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -350,6 +350,19 @@ impl DnsRegistry {
         let txn = self.db.begin().await?;
         let generation = next_generation(&txn).await?;
 
+        // Capture the ids we're about to delete so the resolver
+        // long-poll can report them as tombstones. Without this,
+        // every reconcile leaks the old rows into resolvers'
+        // in-memory zone and answer sets grow unboundedly.
+        let to_delete: Vec<i64> = service_endpoints::Entity::find()
+            .select_only()
+            .column(service_endpoints::Column::Id)
+            .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
+            .filter(service_endpoints::Column::OwnerId.eq(owner_id))
+            .into_tuple::<i64>()
+            .all(&txn)
+            .await?;
+
         let deleted = service_endpoints::Entity::delete_many()
             .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
             .filter(service_endpoints::Column::OwnerId.eq(owner_id))
@@ -363,6 +376,8 @@ impl DnsRegistry {
             new_records = drafts.len(),
             "replacing DNS endpoints for owner"
         );
+
+        write_tombstones(&txn, &to_delete, generation).await?;
 
         for d in drafts {
             let now = chrono::Utc::now();
@@ -402,6 +417,18 @@ impl DnsRegistry {
         owner_id: i64,
     ) -> Result<u64, DnsRegistryError> {
         let txn = self.db.begin().await?;
+
+        // Snapshot ids before delete so we can emit tombstones inside
+        // the same transaction.
+        let to_delete: Vec<i64> = service_endpoints::Entity::find()
+            .select_only()
+            .column(service_endpoints::Column::Id)
+            .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
+            .filter(service_endpoints::Column::OwnerId.eq(owner_id))
+            .into_tuple::<i64>()
+            .all(&txn)
+            .await?;
+
         let res = service_endpoints::Entity::delete_many()
             .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
             .filter(service_endpoints::Column::OwnerId.eq(owner_id))
@@ -411,7 +438,8 @@ impl DnsRegistry {
         // Bump the generation iff something actually changed; otherwise
         // we'd churn the long-poll cursor for nothing.
         if res.rows_affected > 0 {
-            let _ = next_generation(&txn).await?;
+            let generation = next_generation(&txn).await?;
+            write_tombstones(&txn, &to_delete, generation).await?;
         }
         txn.commit().await?;
         Ok(res.rows_affected)
@@ -436,38 +464,93 @@ impl DnsRegistry {
         // Tier 2: orphan service_member records. NOT EXISTS is faster than
         // a LEFT JOIN here because owner_id is BIGINT and service_members.id
         // is INT — the planner uses the PK index either way, but NOT EXISTS
-        // lets it short-circuit on the first match.
-        let tier2 = txn
-            .execute(Statement::from_string(
+        // lets it short-circuit on the first match. RETURNING id captures
+        // the deleted rows so we can emit tombstones in the same txn.
+        let tier2_ids = collect_returned_ids(
+            txn.query_all(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 "DELETE FROM service_endpoints \
                  WHERE owner_kind = 'service_member' \
                  AND NOT EXISTS ( \
                      SELECT 1 FROM service_members WHERE id = service_endpoints.owner_id \
-                 )"
-                .to_string(),
+                 ) \
+                 RETURNING id"
+                    .to_string(),
             ))
-            .await?;
+            .await?,
+        )?;
 
         // Tier 3: orphan service_role records (owner_id is external_services.id).
-        let tier3 = txn
-            .execute(Statement::from_string(
+        let tier3_ids = collect_returned_ids(
+            txn.query_all(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 "DELETE FROM service_endpoints \
                  WHERE owner_kind = 'service_role' \
                  AND NOT EXISTS ( \
                      SELECT 1 FROM external_services WHERE id = service_endpoints.owner_id \
-                 )"
-                .to_string(),
+                 ) \
+                 RETURNING id"
+                    .to_string(),
             ))
-            .await?;
+            .await?,
+        )?;
 
-        let total = tier2.rows_affected() + tier3.rows_affected();
+        let total = tier2_ids.len() as u64 + tier3_ids.len() as u64;
         if total > 0 {
-            let _ = next_generation(&txn).await?;
+            let generation = next_generation(&txn).await?;
+            write_tombstones(&txn, &tier2_ids, generation).await?;
+            write_tombstones(&txn, &tier3_ids, generation).await?;
         }
         txn.commit().await?;
         Ok(total)
+    }
+
+    /// Prune tombstones that every live resolver has already applied.
+    ///
+    /// A tombstone is safe to drop once `deleted_at_generation <= MIN(
+    /// applied_generation) across all rows in `node_dns_state`. If
+    /// there are no rows in `node_dns_state` (fresh cluster, no
+    /// resolvers ever connected) we leave tombstones in place — the
+    /// row count is bounded by the rate of DNS churn, not by anything
+    /// resolver-side.
+    ///
+    /// Returns the number of tombstones removed. Does **not** bump
+    /// the generation: removing a tombstone is invisible to clients
+    /// who already applied it.
+    pub async fn gc_tombstones(&self) -> Result<u64, DnsRegistryError> {
+        let txn = self.db.begin().await?;
+
+        // MIN(applied_generation) across all known nodes. NULL when
+        // node_dns_state is empty.
+        let row = txn
+            .query_one(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT MIN(applied_generation) AS min_applied FROM node_dns_state".to_string(),
+            ))
+            .await?;
+        let min_applied: Option<i64> = match row {
+            Some(r) => r
+                .try_get::<Option<i64>>("", "min_applied")
+                .map_err(DnsRegistryError::Database)?,
+            None => None,
+        };
+
+        let Some(min_applied) = min_applied else {
+            txn.commit().await?;
+            return Ok(0);
+        };
+
+        let res = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM dns_endpoint_tombstones \
+                 WHERE deleted_at_generation <= $1",
+                [min_applied.into()],
+            ))
+            .await?;
+
+        txn.commit().await?;
+        Ok(res.rows_affected())
     }
 
     /// Drift-detection query: list nodes whose resolver hasn't ACK'd any
@@ -520,15 +603,18 @@ impl DnsRegistry {
     }
 
     /// Long-poll diff. Returns records with `generation > since` plus
-    /// (separately) the IDs of any records the agent should drop.
+    /// the IDs of any records the agent should drop.
     ///
-    /// Note: with the current "delete-old, insert-new" replace semantics,
-    /// removed records leave no row behind we can hand back as a tombstone.
-    /// Step 2 (the resolver crate) handles this by replacing the entire
-    /// zone whenever it observes a generation jump it can't account for —
-    /// for now we always return `removed_ids = []` and let the resolver
-    /// reconcile by name. If the diff is large or `since=0`, the response
-    /// is a full snapshot instead.
+    /// Removed ids come from `dns_endpoint_tombstones`, which every
+    /// `service_endpoints` deletion writes to inside the same
+    /// transaction (see `replace_endpoints_for_owner`,
+    /// `delete_by_owner`, `gc_orphan_records`). Without this, resolvers
+    /// retain rows whose ids no longer exist and answer sets grow
+    /// unboundedly across reconciles.
+    ///
+    /// If the upserts alone exceed [`SNAPSHOT_THRESHOLD`] or `since=0`,
+    /// the response is a full snapshot instead and `removed_ids` is
+    /// empty (the snapshot's record set is authoritative).
     pub async fn get_changes_since(&self, since: i64) -> Result<ChangeSet, DnsRegistryError> {
         let current = current_generation(self.db.as_ref()).await?;
         if since <= 0 || current <= since {
@@ -573,11 +659,20 @@ impl DnsRegistry {
             });
         }
 
+        let removed_ids: Vec<i64> = dns_endpoint_tombstones::Entity::find()
+            .select_only()
+            .column(dns_endpoint_tombstones::Column::OriginalId)
+            .filter(dns_endpoint_tombstones::Column::DeletedAtGeneration.gt(since))
+            .order_by_asc(dns_endpoint_tombstones::Column::DeletedAtGeneration)
+            .into_tuple::<i64>()
+            .all(self.db.as_ref())
+            .await?;
+
         Ok(ChangeSet {
             generation: current,
             full_snapshot: false,
             records,
-            removed_ids: vec![],
+            removed_ids,
         })
     }
 
@@ -705,6 +800,43 @@ async fn next_generation(txn: &DatabaseTransaction) -> Result<i64, DnsRegistryEr
         .try_get("", "current")
         .map_err(DnsRegistryError::Database)?;
     Ok(g)
+}
+
+/// Write a tombstone for each deleted `service_endpoints.id`. Caller
+/// owns the transaction and is responsible for committing. No-op when
+/// `ids` is empty.
+async fn write_tombstones(
+    txn: &DatabaseTransaction,
+    ids: &[i64],
+    generation: i64,
+) -> Result<(), DnsRegistryError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now();
+    let active: Vec<dns_endpoint_tombstones::ActiveModel> = ids
+        .iter()
+        .map(|id| dns_endpoint_tombstones::ActiveModel {
+            original_id: Set(*id),
+            deleted_at_generation: Set(generation),
+            deleted_at: Set(now),
+            ..Default::default()
+        })
+        .collect();
+    dns_endpoint_tombstones::Entity::insert_many(active)
+        .exec(txn)
+        .await?;
+    Ok(())
+}
+
+/// Pull `id` from a `DELETE ... RETURNING id` result set.
+fn collect_returned_ids(rows: Vec<sea_orm::QueryResult>) -> Result<Vec<i64>, DnsRegistryError> {
+    rows.into_iter()
+        .map(|r| {
+            r.try_get::<i64>("", "id")
+                .map_err(DnsRegistryError::Database)
+        })
+        .collect()
 }
 
 async fn current_generation<C: ConnectionTrait>(db: &C) -> Result<i64, DnsRegistryError> {

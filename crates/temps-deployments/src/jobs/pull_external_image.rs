@@ -246,30 +246,57 @@ impl WorkflowTask for PullExternalImageJob {
             }
         }
 
+        // Fall through to `inspect_image` even when the pull stream
+        // returned an error: the image may already be present locally
+        // (air-gapped install, dev cluster with `docker save | docker
+        // load`, retagged image). We only fail the job when neither
+        // the pull nor the local inspect produces a usable image.
         if !pull_succeeded {
-            if let Some(error) = last_error {
-                return Ok(JobResult::failure(
-                    context,
-                    format!("Failed to pull image {}: {}", self.image_ref, error),
-                ));
+            if let Some(ref error) = last_error {
+                self.log(
+                    LogLevel::Warning,
+                    &format!(
+                        "⚠️  Pull failed ({}); checking for an existing local image",
+                        error
+                    ),
+                )
+                .await;
             }
-            // Check if we can still find the image (might have been pulled previously)
         }
 
-        // Inspect the image to get details
-        self.log(LogLevel::Info, "🔍 Inspecting pulled image...")
-            .await;
+        // Inspect the image to get details. If pull failed AND the
+        // image isn't local either, we surface the original pull error
+        // so operators see *why* we couldn't fetch it, not a generic
+        // "image not found" from inspect.
+        self.log(LogLevel::Info, "🔍 Inspecting image...").await;
 
-        let image_inspect = self
-            .docker
-            .inspect_image(&self.image_ref)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!(
+        let image_inspect = match self.docker.inspect_image(&self.image_ref).await {
+            Ok(inspect) => {
+                if !pull_succeeded {
+                    self.log(
+                        LogLevel::Info,
+                        &format!("📦 Using local image: {}", self.image_ref),
+                    )
+                    .await;
+                }
+                inspect
+            }
+            Err(inspect_err) => {
+                if let Some(pull_err) = last_error {
+                    return Ok(JobResult::failure(
+                        context,
+                        format!(
+                            "Failed to pull image {}: {} (and no local image found: {})",
+                            self.image_ref, pull_err, inspect_err
+                        ),
+                    ));
+                }
+                return Err(WorkflowError::JobExecutionFailed(format!(
                     "Failed to inspect image {}: {}",
-                    self.image_ref, e
-                ))
-            })?;
+                    self.image_ref, inspect_err
+                )));
+            }
+        };
 
         let image_id = image_inspect.id.unwrap_or_default();
         let size_bytes = image_inspect.size.unwrap_or(0) as u64;

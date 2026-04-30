@@ -160,10 +160,33 @@ pub async fn create_service(
         );
     }
 
+    // Override the CP-supplied primary network with this agent's overlay
+    // when the overlay is bootstrapped on this host. The CP still sends
+    // the legacy `temps-app-network` name (created on the CP host for
+    // CP-local containers), but workers don't have that network — and
+    // shouldn't. The agent owns its data plane: every worker container
+    // is born on the overlay (`temps0`), reachable across nodes by FQDN.
+    //
+    // Single-host installs where the overlay never came up keep the
+    // existing behaviour — pass `request.network` through untouched and
+    // let the dual-attach no-op below skip silently.
+    let primary_network = resolve_primary_network(docker, request.network.as_deref()).await;
+    if let (Some(requested), Some(actual)) = (request.network.as_deref(), primary_network.as_deref())
+    {
+        if requested != actual {
+            tracing::warn!(
+                container = %container_name,
+                requested = %requested,
+                using = %actual,
+                "control plane requested network not present on this worker; using overlay instead"
+            );
+        }
+    }
+
     let host_config = bollard::models::HostConfig {
         binds: Some(binds),
         port_bindings: Some(port_bindings),
-        network_mode: request.network.clone(),
+        network_mode: primary_network.clone(),
         dns: dns_servers,
         restart_policy: Some(bollard::models::RestartPolicy {
             name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
@@ -1264,15 +1287,49 @@ fn build_s3_restore_env(request: &ServiceRestoreRequest) -> HashMap<String, Stri
 }
 
 /// Attach a container to the multi-host overlay network (ADR-011) if the
+/// Resolve the primary Docker network for an agent-managed container.
+///
+/// Workers don't run with the CP's legacy `temps-app-network`. Whenever
+/// the agent has its overlay (`temps0`) bootstrapped, that's the primary
+/// network — no dual-attach needed, no leaked CP-side names.
+///
+/// Returns:
+///   - `Some(overlay_name)` when the overlay bridge exists on this host,
+///   - `Some(requested)`    when it doesn't but the CP supplied a name
+///     (single-host install where the operator hand-created
+///     `temps-app-network` — preserve the legacy behaviour),
+///   - `None`               when neither is available; Docker will
+///     fall back to its default `bridge` network.
+async fn resolve_primary_network(
+    docker: &bollard::Docker,
+    requested: Option<&str>,
+) -> Option<String> {
+    let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+
+    let networks = docker
+        .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+        .await
+        .ok()?;
+    let overlay_present = networks
+        .iter()
+        .any(|n| n.name.as_deref() == Some(overlay_name.as_str()));
+    if overlay_present {
+        return Some(overlay_name);
+    }
+
+    requested.map(str::to_string)
+}
+
 /// overlay exists on this host. Best-effort: returns `Ok(())` when the
 /// overlay isn't bootstrapped yet (single-host mode) or when the
 /// container is already attached. Only true bollard errors propagate.
 ///
-/// The agent calls this between `create_container` and `start_container`
-/// for service members so they come up dual-attached to both the legacy
-/// `temps-app-network` (so existing single-host code paths keep working)
-/// AND `temps-overlay` (so cross-node DNS records can be written and
-/// apps anywhere on the overlay can reach the container by FQDN VIP).
+/// Now that `resolve_primary_network` makes the overlay the *primary*
+/// network when it's available, this dual-attach is a true no-op in the
+/// happy path (the 403 "already connected" branch fires). It still runs
+/// to cover the legacy single-host case where `request.network` is
+/// `temps-app-network` and the overlay was bootstrapped *after* the
+/// previous reconcile — at which point dual-attach is genuinely useful.
 async fn attach_to_overlay_if_present(
     docker: &bollard::Docker,
     container_id: &str,

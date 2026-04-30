@@ -231,6 +231,158 @@ async fn get_changes_since_returns_diff_or_snapshot() {
     );
 }
 
+/// Reproduces the unbounded-zone-growth bug: `replace_endpoints_for_owner`
+/// allocates a fresh `service_endpoints.id` for every reconcile, and the
+/// long-poll diff must report the deleted ids so the resolver can drop
+/// them. Without tombstones, resolvers retained 100+ records for a single
+/// FQDN after a few hours of role-reconciler churn and answer sets
+/// exceeded UDP's 512-byte limit, breaking client-side parsing.
+#[tokio::test]
+async fn get_changes_since_reports_removed_ids_after_replace() {
+    let Some(db) = boot_db().await else { return };
+    let registry = DnsRegistry::new(db.clone());
+
+    // First write — capture the id that will be deleted on the next replace.
+    let _g1 = registry
+        .replace_endpoints_for_owner(
+            OwnerKind::ServiceMember,
+            500,
+            &[draft("churn.temps.local", "1.1.1.1", 500)],
+        )
+        .await
+        .unwrap();
+    let zone_after_first = registry.get_full_zone().await.unwrap();
+    let first_id = zone_after_first
+        .records
+        .iter()
+        .find(|r| r.fqdn == "churn.temps.local")
+        .expect("first record present")
+        .id;
+    let baseline_gen = zone_after_first.generation;
+
+    // Replace with a different IP — this deletes the row above and
+    // inserts a fresh one. Resolvers that already saw `first_id`
+    // need to be told to drop it.
+    let _g2 = registry
+        .replace_endpoints_for_owner(
+            OwnerKind::ServiceMember,
+            500,
+            &[draft("churn.temps.local", "2.2.2.2", 500)],
+        )
+        .await
+        .unwrap();
+
+    let diff = registry.get_changes_since(baseline_gen).await.unwrap();
+    assert!(
+        !diff.full_snapshot,
+        "small diff must not fall back to snapshot"
+    );
+    assert!(
+        diff.removed_ids.contains(&first_id),
+        "removed_ids must include the deleted row id {first_id}, got {:?}",
+        diff.removed_ids
+    );
+    assert!(
+        diff.records
+            .iter()
+            .any(|r| r.target_ip.as_deref() == Some("2.2.2.2")),
+        "upserts must include the new row"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_owner_writes_tombstones() {
+    let Some(db) = boot_db().await else { return };
+    let registry = DnsRegistry::new(db.clone());
+
+    let _ = registry
+        .replace_endpoints_for_owner(
+            OwnerKind::ServiceMember,
+            501,
+            &[draft("dropme.temps.local", "9.9.9.9", 501)],
+        )
+        .await
+        .unwrap();
+    let pre = registry.get_full_zone().await.unwrap();
+    let id = pre
+        .records
+        .iter()
+        .find(|r| r.fqdn == "dropme.temps.local")
+        .unwrap()
+        .id;
+    let baseline = pre.generation;
+
+    let removed = registry
+        .delete_by_owner(OwnerKind::ServiceMember, 501)
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    let diff = registry.get_changes_since(baseline).await.unwrap();
+    assert!(
+        diff.removed_ids.contains(&id),
+        "delete_by_owner must produce a tombstone for id {id}, got {:?}",
+        diff.removed_ids
+    );
+}
+
+#[tokio::test]
+async fn gc_tombstones_prunes_only_universally_applied_rows() {
+    let Some(db) = boot_db().await else { return };
+    let registry = DnsRegistry::new(db.clone());
+
+    // Two nodes — one keeps up, one lags. Tombstones the lagging
+    // node hasn't applied must NOT be pruned.
+    let leading = insert_node(&db, "tomb-leading", "tomb-tok-1").await;
+    let lagging = insert_node(&db, "tomb-lagging", "tomb-tok-2").await;
+
+    // Generate a tombstone via replace.
+    let _ = registry
+        .replace_endpoints_for_owner(
+            OwnerKind::ServiceMember,
+            600,
+            &[draft("tomb-a.temps.local", "10.0.0.1", 600)],
+        )
+        .await
+        .unwrap();
+    let _ = registry
+        .replace_endpoints_for_owner(
+            OwnerKind::ServiceMember,
+            600,
+            &[draft("tomb-a.temps.local", "10.0.0.2", 600)],
+        )
+        .await
+        .unwrap();
+    let g_now = registry.get_full_zone().await.unwrap().generation;
+
+    // Leading node ACKs current; lagging node ACKs 0.
+    registry.ack_applied(leading, g_now).await.unwrap();
+    db.execute(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO node_dns_state (node_id, applied_generation, last_sync_at, health) \
+             VALUES ({lagging}, 0, now(), 'healthy')"
+        ),
+    ))
+    .await
+    .unwrap();
+
+    // Lagging node hasn't seen the tombstone yet — pruning must keep it.
+    let pruned = registry.gc_tombstones().await.unwrap();
+    assert_eq!(
+        pruned, 0,
+        "must not prune tombstones the lagging node hasn't applied"
+    );
+
+    // Once the lagging node catches up, the tombstone is safe to drop.
+    registry.ack_applied(lagging, g_now).await.unwrap();
+    let pruned2 = registry.gc_tombstones().await.unwrap();
+    assert!(
+        pruned2 >= 1,
+        "must prune at least one tombstone once every node has applied it, got {pruned2}"
+    );
+}
+
 #[tokio::test]
 async fn ack_applied_persists_state_and_rejects_future_generations() {
     let Some(db) = boot_db().await else { return };
