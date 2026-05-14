@@ -1,0 +1,83 @@
+name: PR88 Linux AMD64 Artifact
+
+on:
+  push:
+    branches:
+      - ci/pr88-linux-amd64-build
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-linux-amd64:
+    name: Build Linux AMD64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pr88-linux-amd64
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install web dependencies
+        run: |
+          cd web
+          bun install
+
+      - name: Install wasm-pack and build WASM
+        run: |
+          cargo install wasm-pack
+          cd crates/temps-captcha-wasm
+          bun run build
+
+      - name: Build release binary
+        run: cargo build --release --bin temps
+        env:
+          FORCE_WEB_BUILD: 1
+          CARGO_INCREMENTAL: 0
+          TEMPS_VERSION: pr88-required-extra-docker-networks-${{ github.sha }}
+
+      - name: Package artifact
+        run: |
+          strip target/release/temps
+          cp target/release/temps temps
+          file temps
+          ./temps --version
+          tar -czf temps-linux-amd64-pr88.tar.gz temps
+          sha256sum temps-linux-amd64-pr88.tar.gz > temps-linux-amd64-pr88.tar.gz.sha256
+          cat temps-linux-amd64-pr88.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: temps-linux-amd64-pr88
+          path: |
+            temps-linux-amd64-pr88.tar.gz
+            temps-linux-amd64-pr88.tar.gz.sha256
