@@ -26,7 +26,9 @@ use temps_backup::BackupPlugin;
 use temps_blob::BlobPlugin;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
-use temps_core::plugin::PluginManager;
+use temps_core::plugin::{PluginManager, TempsPlugin};
+// `TempsPlugin` is used both directly (extra_plugins field) and through
+// `dyn TempsPlugin` in `ConsoleApiParams`.
 use temps_core::templates::TemplateService;
 use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
@@ -63,7 +65,6 @@ use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
-use temps_workspace::plugin::WorkspacePlugin;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
@@ -102,6 +103,8 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
             mfa_enabled: Set(false),
             mfa_secret: Set(None),
             mfa_recovery_codes: Set(None),
+            oidc_subject: Set(None),
+            oidc_provider_id: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -393,12 +396,52 @@ fn create_openapi(plugin_manager: &PluginManager) -> anyhow::Result<utoipa::open
     let nodes_doc = <temps_deployments::handlers::nodes::NodesApiDoc as utoipa::OpenApi>::openapi();
     api_doc.merge(nodes_doc);
 
+    // Merge admin-gate management endpoints (also not part of the plugin system)
+    let gate_doc = <super::admin_gate_handler::AdminGateApiDoc as utoipa::OpenApi>::openapi();
+    api_doc.merge(gate_doc);
+
     Ok(api_doc)
+}
+
+/// Axum middleware that rejects unauthenticated requests to the Swagger UI
+/// and OpenAPI JSON endpoint. The auth middleware stack must have already run
+/// (i.e. be an outer layer) so the `AuthContext` extension is present for
+/// authenticated callers. Anonymous callers — with no valid session cookie or
+/// Bearer token — receive a 401 with a WWW-Authenticate hint.
+async fn require_auth_for_docs(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::header::WWW_AUTHENTICATE;
+    if req.extensions().get::<temps_auth::AuthContext>().is_some() {
+        next.run(req).await
+    } else {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(WWW_AUTHENTICATE, "Bearer realm=\"temps\"")
+            .header(header::CONTENT_TYPE, "application/problem+json")
+            .body(Body::from(
+                r#"{"type":"about:blank","title":"Unauthorized","status":401,"detail":"Authentication required to access the API documentation."}"#,
+            ))
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    }
 }
 
 fn create_swagger_router(plugin_manager: &PluginManager) -> anyhow::Result<Router> {
     let api_doc = create_openapi(plugin_manager)?;
-    Ok(Router::new().merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api_doc)))
+    // Build the raw Swagger router, then add the auth-guard as an inner layer
+    // (applied after the outer auth middleware has already run and injected the
+    // `AuthContext` extension). Axum applies `.layer()` calls in reverse order:
+    // the *last* `.layer()` wraps outermost (runs first).  Because
+    // `apply_middleware_to_router` is called after we add the guard here,
+    // the plugin auth middleware is the outermost shell → runs first →
+    // populates `AuthContext` → then the guard reads it.
+    let swagger =
+        Router::new().merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api_doc));
+    // Add the auth-guard as the innermost layer (runs after auth middleware).
+    let swagger_guarded = swagger.layer(axum::middleware::from_fn(require_auth_for_docs));
+    // Wrap with the full plugin middleware stack (auth context injection, etc.).
+    Ok(plugin_manager.apply_middleware_to_router(swagger_guarded, plugin_manager.get_middleware()))
 }
 
 /// Static file handler for embedded website
@@ -474,10 +517,96 @@ async fn serve_static_file(req: Request) -> Response {
     }
 }
 
-/// Validate GeoLite2-City database exists in multiple locations
-/// Checks: current directory → data directory → home directory
-/// No system dependencies - database file must be placed manually
-fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()> {
+/// Source URL for downloading GeoLite2-City.mmdb when missing on startup.
+/// Mirrors `setup.rs::GEOLITE2_DOWNLOAD_URL` so `temps serve` recovers a missing
+/// database the same way the setup wizard would.
+const GEOLITE2_DOWNLOAD_URL: &str =
+    "https://raw.githubusercontent.com/gotempsh/temps/refs/heads/main/crates/temps-cli/GeoLite2-City.mmdb";
+
+/// Download GeoLite2-City.mmdb to `dest` from GitHub (same source as `temps setup`).
+/// Writes to a sibling `.tmp` file and renames atomically on success.
+async fn download_geolite2_database_on_startup(dest: &Path) -> anyhow::Result<()> {
+    use futures::StreamExt;
+    use std::io::Write;
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create data directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+
+    info!(
+        "Downloading GeoLite2-City.mmdb from {} to {}",
+        GEOLITE2_DOWNLOAD_URL,
+        dest.display()
+    );
+
+    let response = reqwest::Client::new()
+        .get(GEOLITE2_DOWNLOAD_URL)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start GeoLite2 download: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to download GeoLite2 database: HTTP {}",
+            response.status()
+        ));
+    }
+
+    let temp_path = dest.with_extension("mmdb.tmp");
+    let mut file = std::fs::File::create(&temp_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create temporary file {}: {}",
+            temp_path.display(),
+            e
+        )
+    })?;
+
+    let mut stream = response.bytes_stream();
+    let mut downloaded: u64 = 0;
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| anyhow::anyhow!("Download error: {}", e))?;
+        file.write_all(&chunk)
+            .map_err(|e| anyhow::anyhow!("Failed to write to {}: {}", temp_path.display(), e))?;
+        downloaded += chunk.len() as u64;
+    }
+    drop(file);
+
+    std::fs::rename(&temp_path, dest).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to move {} to {}: {}",
+            temp_path.display(),
+            dest.display(),
+            e
+        )
+    })?;
+
+    if downloaded < 1_000_000 {
+        return Err(anyhow::anyhow!(
+            "Downloaded GeoLite2 database is too small ({} bytes); file may be corrupted",
+            downloaded
+        ));
+    }
+
+    info!(
+        "✓ Downloaded GeoLite2 database to {} ({:.1} MB)",
+        dest.display(),
+        downloaded as f64 / 1024.0 / 1024.0
+    );
+
+    Ok(())
+}
+
+/// Validate GeoLite2-City database exists in multiple locations.
+/// Checks current directory and data directory; if neither has the file,
+/// downloads it to `default_db_path` from the same GitHub URL used by
+/// `temps setup`. Errors only after the download attempt fails.
+async fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()> {
     // Check multiple locations in order of preference
     let search_paths = vec![
         // 1. Current working directory (most convenient for local development)
@@ -494,31 +623,42 @@ fn validate_geolite2_database(default_db_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    // Database not found in any location
-    Err(anyhow::anyhow!(
-        "❌ GeoLite2-City.mmdb not found\n\n\
-        The MaxMind GeoLite2 database is required for geolocation features.\n\n\
-        📍 Checked locations (in order):\n\
-        1. {}\n\
-        2. {}\n\n\
-        📥 Setup (once, takes 2 minutes):\n\
-        1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources\n\
-        2. Create free MaxMind account (if needed)\n\
-        3. Download 'GeoLite2-City' (GZIP format: .tar.gz)\n\
-        4. Extract the archive:\n\
-           tar xzf GeoLite2-City_*.tar.gz\n\n\
-        5. Copy the database file to any location above:\n\
-           # Option A: Current directory (recommended for local development)\n\
-           cp GeoLite2-City_*/GeoLite2-City.mmdb .\n\n\
-           # Option B: Data directory\n\
-           cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
-        6. Start the server again\n\n\
-        🐳 For Docker users:\n\
-        See Dockerfile in the repository for embedding the database",
+    // Not found anywhere — attempt automatic download to the data directory,
+    // matching the behaviour of `temps setup`.
+    info!(
+        "GeoLite2 database not found in {} or {}; attempting download",
         search_paths[0].display(),
-        search_paths[1].display(),
         search_paths[1].display()
-    ))
+    );
+    match download_geolite2_database_on_startup(default_db_path).await {
+        Ok(()) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
+            The MaxMind GeoLite2 database is required for geolocation features.\n\n\
+            📍 Checked locations (in order):\n\
+            1. {}\n\
+            2. {}\n\n\
+            ⬇️  Download attempt error: {}\n\n\
+            📥 Manual setup (takes 2 minutes):\n\
+            1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources\n\
+            2. Create free MaxMind account (if needed)\n\
+            3. Download 'GeoLite2-City' (GZIP format: .tar.gz)\n\
+            4. Extract the archive:\n\
+               tar xzf GeoLite2-City_*.tar.gz\n\n\
+            5. Copy the database file to any location above:\n\
+               # Option A: Current directory (recommended for local development)\n\
+               cp GeoLite2-City_*/GeoLite2-City.mmdb .\n\n\
+               # Option B: Data directory\n\
+               cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
+            6. Start the server again\n\n\
+            🐳 For Docker users:\n\
+            See Dockerfile in the repository for embedding the database",
+            search_paths[0].display(),
+            search_paths[1].display(),
+            e,
+            search_paths[1].display()
+        )),
+    }
 }
 
 /// Parameters for starting the console API server.
@@ -535,6 +675,17 @@ pub struct ConsoleApiParams {
     pub ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
     pub additional_templates: Vec<std::path::PathBuf>,
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
+    /// Additional plugins registered by an external entrypoint (e.g. the
+    /// EE binary). Registered immediately before `initialize_plugins`, so
+    /// they observe every OSS service in the registry and can wrap or
+    /// extend them. OSS callers pass an empty Vec.
+    pub extra_plugins: Vec<Box<dyn TempsPlugin>>,
+    /// Pre-built admin-gate service (when the caller wired the gate up
+    /// outside the console). When `None`, the console builds its own.
+    pub admin_gate_service: Option<super::admin_gate_service::AdminGateService>,
+    /// Pre-built admin-gate handle. When `None`, the console derives one
+    /// from the freshly-constructed service above.
+    pub admin_gate_handle: Option<temps_core::admin_gate::AdminGateHandle>,
 }
 
 /// Initialize and start the console API server
@@ -549,6 +700,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         ready_signal,
         additional_templates,
         on_demand_waker,
+        extra_plugins,
+        admin_gate_service: provided_admin_gate_service,
+        admin_gate_handle: provided_admin_gate_handle,
     } = params;
     // PRE-VALIDATE all plugin dependencies BEFORE initializing plugin manager
     // This ensures clear error messages if any critical resources are missing
@@ -582,7 +736,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // 2. Validate GeoPlugin dependencies (GeoLite2 database)
     debug!("Checking GeoLite2 database...");
     let geo_db_path = config.data_dir.join("GeoLite2-City.mmdb");
-    validate_geolite2_database(&geo_db_path)?;
+    validate_geolite2_database(&geo_db_path).await?;
     debug!("✓ GeoLite2 database file found");
 
     // 3. Validate logs directory is writable
@@ -800,16 +954,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     plugin_manager.register_plugin(agents_plugin);
 
     // 9. DeploymentsPlugin - provides deployment orchestration (depends on deployer, screenshots, and vulnerability scanner)
-    // Must be registered before WorkspacePlugin so WorkspacePlugin can resolve DeploymentTokenService in phase 1.
     debug!("Registering DeploymentsPlugin");
     let deployments_plugin = Box::new(DeploymentsPlugin::new());
     plugin_manager.register_plugin(deployments_plugin);
-
-    // 8.7. WorkspacePlugin - interactive AI workspace sessions.
-    // Registered after AgentsPlugin (sandbox provider) and DeploymentsPlugin (deployment token service).
-    debug!("Registering WorkspacePlugin");
-    let workspace_plugin = Box::new(WorkspacePlugin::new());
-    plugin_manager.register_plugin(workspace_plugin);
 
     // 8.8. SandboxPlugin - Vercel-compatible `/v1/sandbox/*` API.
     // Consumes the shared SandboxProvider registered by AgentsPlugin.
@@ -917,6 +1064,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     ));
     plugin_manager.register_plugin(external_plugins_plugin);
 
+    // Extra plugins from the calling binary (EE, etc.). Registered last so
+    // they can resolve every OSS service via `require_service`. See ADR 0001
+    // §"Extension points exposed by OSS" — this is the
+    // single seam between an OSS build and an EE-bundled binary.
+    let extra_count = extra_plugins.len();
+    for plugin in extra_plugins {
+        debug!("Registering extra plugin: {}", plugin.name());
+        plugin_manager.register_plugin(plugin);
+    }
+    if extra_count > 0 {
+        info!(
+            "Registered {} extra plugin(s) from binary entrypoint",
+            extra_count
+        );
+    }
+
     // Initialize all plugins
     debug!("Initializing plugins");
     if let Err(e) = plugin_manager.initialize_plugins().await {
@@ -970,7 +1133,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("UserService not available, skipping user initialization");
     }
 
-    // Start backup scheduler if BackupService is available
+    // Start backup scheduler if BackupService is available.
+    // The scheduler enqueues due jobs; the in-process BackupExecutor (registered
+    // by BackupPlugin) picks them up and runs them.
     if let Some(backup_service) = service_context.get_service::<temps_backup::BackupService>() {
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let scheduler_token = cancellation_token.clone();
@@ -985,7 +1150,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 tracing::error!("Backup scheduler error: {}", e);
             }
         });
-
         debug!("Backup scheduler started in background");
         // Note: Currently no graceful shutdown mechanism for cancellation_token
         // In the future, this could be wired to a shutdown signal handler
@@ -1036,11 +1200,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         service_context.get_service::<temps_config::ConfigService>(),
         service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
     ) {
-        let data_dir = config.data_dir.clone();
         let monitor = Arc::new(DiskSpaceMonitor::new(
             config_service.clone(),
             notification_service,
-            data_dir,
         ));
 
         tokio::spawn(async move {
@@ -1085,13 +1247,44 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         if let Some(container_deployer) =
             service_context.get_service::<dyn temps_deployer::ContainerDeployer>()
         {
-            let health_monitor = Arc::new(ContainerHealthMonitor::new(
+            // Build the metrics store if monitoring is enabled, so container
+            // resource metrics are written alongside the alarm logic.
+            let container_metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>> = {
+                use temps_core::MetricsStoreKind;
+                use temps_metrics::{MetricsStore, TimescaleMetricsStore};
+
+                // Always provide a TimescaleDB-backed store for container metrics.
+                // ClickHouse is the only unsupported store and falls back to None.
+                match service_context.get_service::<temps_config::ConfigService>() {
+                    Some(cfg_svc) => match cfg_svc.get_settings().await {
+                        Ok(settings) => match settings.monitoring.store {
+                            MetricsStoreKind::TimescaleDb => {
+                                Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
+                                    as Arc<dyn MetricsStore>)
+                            }
+                            MetricsStoreKind::ClickHouse => {
+                                debug!("ClickHouse metrics store is not yet supported; container metrics disabled");
+                                None
+                            }
+                        },
+                        _ => None,
+                    },
+                    None => None,
+                }
+            };
+
+            let mut health_monitor = ContainerHealthMonitor::new(
                 db.clone(),
                 container_deployer,
-                alarm_service,
+                alarm_service.clone(),
                 ContainerHealthConfig::default(),
-            ));
+            );
 
+            if let Some(ms) = container_metrics_store {
+                health_monitor = health_monitor.with_metrics_store(ms);
+            }
+
+            let health_monitor = Arc::new(health_monitor);
             tokio::spawn(async move {
                 health_monitor.start().await;
             });
@@ -1099,6 +1292,134 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             debug!("Container health monitor started (poll interval: 30s)");
         } else {
             debug!("ContainerDeployer not available - container health monitoring disabled");
+        }
+
+        // Start MetricsScraper for external service DB-level metrics
+        // (postgres, redis, mongodb) when monitoring is enabled.
+        if let (Some(cfg_svc), Some(enc_svc)) = (
+            service_context.get_service::<temps_config::ConfigService>(),
+            service_context.get_service::<temps_core::EncryptionService>(),
+        ) {
+            use temps_core::MetricsStoreKind;
+            use temps_metrics::{MetricsScraper, MetricsStore, TimescaleMetricsStore};
+
+            // The metrics store and scraper are ALWAYS wired up — the per-service
+            // `metrics_enabled` flag is the single source of truth for what gets
+            // scraped. The scraper idles (near-zero cost) when no service has
+            // monitoring enabled, so a user clicking "Enable Monitoring" on a
+            // service just works without an operator first flipping a global flag.
+            //
+            // ClickHouse is the only unsupported store; we always fall back to
+            // TimescaleDB until it lands.
+            match cfg_svc.get_settings().await {
+                Ok(settings) => {
+                    if matches!(settings.monitoring.store, MetricsStoreKind::ClickHouse) {
+                        debug!("ClickHouse metrics store not yet supported; using TimescaleDB");
+                    }
+                    let metrics_store: Arc<dyn MetricsStore> =
+                        Arc::new(TimescaleMetricsStore::new(db.clone()));
+
+                    // Register the metrics store so plugins (e.g. providers)
+                    // can retrieve it for HTTP query endpoints.
+                    service_context.register_service(metrics_store.clone());
+
+                    let scraper = Arc::new(MetricsScraper::new(
+                        db.clone(),
+                        metrics_store.clone(),
+                        cfg_svc,
+                        enc_svc,
+                    ));
+
+                    tokio::spawn(async move {
+                        scraper.start().await;
+                    });
+
+                    debug!(
+                        "MetricsScraper started (scrapes only services with metrics_enabled=true)"
+                    );
+
+                    // Start AlertEvaluator alongside the scraper.
+                    // It reads monitoring_alert_rules from the DB and evaluates
+                    // each rule against the most-recent value from MetricsStore,
+                    // firing/resolving alarms via the shared AlarmService.
+                    let evaluator = Arc::new(temps_monitoring::AlertEvaluator::new(
+                        db.clone(),
+                        metrics_store,
+                        alarm_service.clone(),
+                    ));
+
+                    tokio::spawn(async move {
+                        evaluator.start().await;
+                    });
+
+                    debug!("AlertEvaluator started (metric threshold alerts, 30s interval)");
+
+                    // Start hourly pruning job for raw service_metrics rows.
+                    // Continuous aggregates (hourly/daily rollups) have their
+                    // own TimescaleDB retention policies; this only handles
+                    // the raw hypertable rows.
+                    {
+                        use chrono::{Duration, Utc};
+                        use temps_core::MetricsStoreKind;
+                        use temps_metrics::{MetricsStore, TimescaleMetricsStore};
+
+                        let prune_db = db.clone();
+                        let prune_cfg =
+                            service_context.get_service::<temps_config::ConfigService>();
+
+                        tokio::spawn(async move {
+                            let mut interval =
+                                tokio::time::interval(std::time::Duration::from_secs(3600));
+                            loop {
+                                interval.tick().await;
+                                let Some(ref cfg_svc) = prune_cfg else {
+                                    break;
+                                };
+                                let settings = match cfg_svc.get_settings().await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "PruneMetrics: failed to read settings: {e}"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let store: Arc<dyn MetricsStore> = match settings.monitoring.store {
+                                    MetricsStoreKind::TimescaleDb => {
+                                        Arc::new(TimescaleMetricsStore::new(prune_db.clone()))
+                                    }
+                                    MetricsStoreKind::ClickHouse => {
+                                        debug!(
+                                            "PruneMetrics: ClickHouse not yet supported, skipping"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let cutoff = Utc::now()
+                                    - Duration::days(settings.monitoring.retention_raw_days as i64);
+                                match store.prune(cutoff).await {
+                                    Ok(n) => {
+                                        debug!(
+                                            "PruneMetrics: pruned {} raw metric rows older than {}",
+                                            n, cutoff
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("PruneMetrics: prune failed: {e}");
+                                    }
+                                }
+                            }
+                        });
+
+                        debug!("Metrics pruning job scheduled (hourly)");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read monitoring settings: {e} — MetricsScraper and AlertEvaluator not started");
+                }
+            }
+        } else {
+            debug!("ConfigService or EncryptionService not available — MetricsScraper and AlertEvaluator not started");
         }
     } else {
         tracing::warn!(
@@ -1206,49 +1527,140 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);
 
-    let app = plugin_manager
-        .build_application()
-        .map_err(|e| anyhow::anyhow!("Failed to build application: {}", e))?
-        .merge(create_swagger_router(&plugin_manager)?)
-        .nest("/api", node_routes)
-        .nest("/api", route_sync_routes);
+    // Build the split application: public routes (event ingest, AI gateway,
+    // session replay ingest, etc.) and admin routes (auth, dashboard, CRUD).
+    let split = plugin_manager
+        .build_split_application()
+        .map_err(|e| anyhow::anyhow!("Failed to build application: {}", e))?;
 
-    let app = app.fallback(serve_static_file);
+    // Agent-facing node + route-sync routes are public (workers anywhere on
+    // the internet POST to them with bearer tokens).
+    let public_router = split.public.merge(node_routes).merge(route_sync_routes);
+
+    // Use the caller-supplied admin-gate when present (so the proxy and the
+    // console share one source of truth) and otherwise build a fresh one.
+    let (admin_gate_service, admin_gate_handle) =
+        match (provided_admin_gate_service, provided_admin_gate_handle) {
+            (Some(svc), Some(handle)) => (svc, handle),
+            _ => super::admin_gate_service::AdminGateService::new(
+                db.clone(),
+                &config.admin_allowed_ips,
+                &config.admin_allowed_hosts,
+                config.admin_trust_forwarded_for,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize admin gate: {}", e))?,
+        };
+    let admin_gate_state = Arc::new(super::admin_gate_handler::AdminGateAppState {
+        service: admin_gate_service,
+    });
+    // Re-apply the plugin middleware stack (auth, request metadata, audit)
+    // to our standalone admin-gate routes. Without this, RequireAuth finds
+    // no AuthContext injected and the route 401s for logged-in users —
+    // `Router::merge` does not propagate parent layers to merged routes.
+    let admin_gate_routes = super::admin_gate_handler::configure_routes(admin_gate_state);
+    let admin_gate_routes = plugin_manager
+        .apply_middleware_to_router(admin_gate_routes, plugin_manager.get_middleware());
+
+    // Swagger UI + the embedded SPA only live on the admin surface. So do
+    // the admin-gate management routes.
+    let admin_router = split
+        .admin
+        .merge(create_swagger_router(&plugin_manager)?)
+        .merge(admin_gate_routes);
+
+    // Wrap each surface in /api like the original single-router did, except
+    // for the SPA fallback which serves the dashboard at the document root.
+    let public_app = Router::new().nest("/api", public_router);
+    let admin_app = Router::new()
+        .nest("/api", admin_router)
+        .fallback(serve_static_file);
+
+    // Defense-in-depth: the Pingora proxy is now the primary enforcer (it
+    // 404s gated requests before they ever reach this listener). The axum
+    // middleware below only matters when something connects to the console
+    // listener directly — e.g. loopback debugging, or a deployment where
+    // the operator points an external reverse-proxy at console_address
+    // instead of going through Pingora. The middleware short-circuits when
+    // the active config is a noop, so the perf cost is negligible.
+    let admin_app = admin_app.layer(axum::middleware::from_fn_with_state(
+        admin_gate_handle.clone(),
+        super::admin_gate::admin_gate,
+    ));
 
     info!("Plugin system initialized successfully with static file serving");
 
-    // Start the HTTP server
-    let listener = TcpListener::bind(&config.console_address).await?;
-    info!("Console API server listening on {}", config.console_address);
-
-    // Signal that the console API is ready
-    if let Some(signal) = ready_signal {
-        let _ = signal.send(());
-        debug!("Console API ready signal sent");
-    }
-
-    // Graceful shutdown: listen for Ctrl+C, then shut down external plugins before exiting.
-    // Note: The proxy server has its own CtrlCShutdownSignal. The console API server
-    // shuts down external plugins when it receives the same signal.
     let external_plugins_service = plugin_manager
         .service_context()
         .get_service::<temps_external_plugins::ExternalPluginsService>();
-    // Use into_make_service_with_connect_info so handlers/middleware can read
-    // the immediate peer SocketAddr — required by rate-limiter to decide if
-    // X-Forwarded-For headers should be trusted (only from loopback proxies).
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Console API received shutdown signal, stopping external plugins...");
-        if let Some(service) = external_plugins_service {
-            service.shutdown_all().await;
-            info!("External plugins shut down");
+
+    let shutdown_signal = {
+        let svc = external_plugins_service.clone();
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Console API received shutdown signal, stopping external plugins...");
+            if let Some(service) = svc {
+                service.shutdown_all().await;
+                info!("External plugins shut down");
+            }
         }
-    })
-    .await?;
+        .shared()
+    };
+
+    match config.console_admin_address.as_deref() {
+        Some(admin_addr) if !admin_addr.is_empty() => {
+            // Two-listener mode: public + admin on separate addresses.
+            let public_listener = TcpListener::bind(&config.console_address).await?;
+            info!(
+                "Console PUBLIC API server listening on {}",
+                config.console_address
+            );
+            let admin_listener = TcpListener::bind(admin_addr).await?;
+            info!("Console ADMIN API server listening on {}", admin_addr);
+
+            if let Some(signal) = ready_signal {
+                let _ = signal.send(());
+                debug!("Console API ready signal sent");
+            }
+
+            let public_fut = axum::serve(
+                public_listener,
+                public_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal.clone());
+
+            let admin_fut = axum::serve(
+                admin_listener,
+                admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal);
+
+            tokio::try_join!(public_fut, admin_fut)?;
+        }
+        _ => {
+            // Single-listener mode (backwards compatible): merge public + admin
+            // and serve from `console_address`. Admin gate still applies if
+            // configured, but it now gates the merged surface — operators who
+            // want network-layer isolation should set TEMPS_CONSOLE_ADMIN_ADDRESS.
+            let merged = Router::new().merge(public_app).merge(admin_app);
+
+            let listener = TcpListener::bind(&config.console_address).await?;
+            info!("Console API server listening on {}", config.console_address);
+
+            if let Some(signal) = ready_signal {
+                let _ = signal.send(());
+                debug!("Console API ready signal sent");
+            }
+
+            axum::serve(
+                listener,
+                merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal)
+            .await?;
+        }
+    }
+
     info!("Console API server exited");
     Ok(())
 }

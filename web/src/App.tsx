@@ -9,6 +9,11 @@ import { ThemeWrapper } from '@/components/theme/ThemeWrapper'
 import { ProjectsProvider } from '@/contexts/ProjectsContext'
 import { PresetProvider } from '@/contexts/PresetContext'
 import { PluginsProvider } from '@/contexts/PluginsContext'
+import {
+  ConsoleExtensionsProvider,
+  useConsoleExtensions,
+  type ConsoleExtensions,
+} from '@temps-sdk/console-kit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense } from 'react'
@@ -53,6 +58,9 @@ const ImportService = lazy(() =>
 )
 const ServiceDetail = lazy(() =>
   import('./pages/ServiceDetail').then((m) => ({ default: m.ServiceDetail }))
+)
+const ServiceMonitoring = lazy(() =>
+  import('./pages/ServiceMonitoring').then((m) => ({ default: m.ServiceMonitoring }))
 )
 const ServiceDataBrowser = lazy(() =>
   import('./pages/ServiceDataBrowser').then((m) => ({
@@ -121,6 +129,24 @@ const BackupDetail = lazy(() =>
 const CreateS3Source = lazy(() =>
   import('./pages/CreateS3Source').then((m) => ({ default: m.CreateS3Source }))
 )
+const CreateBackupSchedule = lazy(() =>
+  import('./pages/CreateBackupSchedule').then((m) => ({
+    default: m.CreateBackupSchedule,
+  }))
+)
+const EditBackupSchedule = lazy(() =>
+  import('./pages/EditBackupSchedule').then((m) => ({
+    default: m.EditBackupSchedule,
+  }))
+)
+const ScheduleDetail = lazy(() =>
+  import('./pages/ScheduleDetail').then((m) => ({ default: m.ScheduleDetail }))
+)
+const ScheduleRunDetail = lazy(() =>
+  import('./pages/ScheduleRunDetail').then((m) => ({
+    default: m.ScheduleRunDetail,
+  }))
+)
 const NewProject = lazy(() =>
   import('./pages/NewProject').then((m) => ({ default: m.NewProject }))
 )
@@ -169,6 +195,12 @@ const ApiKeyDetail = lazy(() => import('./pages/ApiKeyDetail'))
 const MfaVerify = lazy(() =>
   import('./pages/MfaVerify').then((m) => ({ default: m.MfaVerify }))
 )
+const ForgotPassword = lazy(() =>
+  import('./pages/ForgotPassword').then((m) => ({ default: m.ForgotPassword }))
+)
+const ResetPassword = lazy(() =>
+  import('./pages/ResetPassword').then((m) => ({ default: m.ResetPassword }))
+)
 const NotFound = lazy(() => import('./components/global/NotFound'))
 
 // Settings sub-pages
@@ -190,6 +222,31 @@ const RateLimitingPage = lazy(() =>
 const DiskMonitoringPage = lazy(() =>
   import('./pages/settings/DiskMonitoringPage').then((m) => ({
     default: m.DiskMonitoringPage,
+  }))
+)
+const BuildLimitsPage = lazy(() =>
+  import('./pages/settings/BuildLimitsPage').then((m) => ({
+    default: m.BuildLimitsPage,
+  }))
+)
+const MetricsMonitoringPage = lazy(() =>
+  import('./pages/settings/MonitoringSettingsPage').then((m) => ({
+    default: m.MonitoringSettingsPage,
+  }))
+)
+const AuthSettingsPage = lazy(() =>
+  import('./pages/settings/AuthSettingsPage').then((m) => ({
+    default: m.AuthSettingsPage,
+  }))
+)
+const CreateOidcProviderPage = lazy(() =>
+  import('./pages/settings/CreateOidcProviderPage').then((m) => ({
+    default: m.CreateOidcProviderPage,
+  }))
+)
+const OidcProviderDetailPage = lazy(() =>
+  import('./pages/settings/OidcProviderDetailPage').then((m) => ({
+    default: m.OidcProviderDetailPage,
   }))
 )
 const PluginsPage = lazy(() =>
@@ -277,6 +334,7 @@ const PageLoader = () => (
 
 // Full app routes with sidebar
 const FullAppRoutes = () => {
+  const { routes: extraRoutes } = useConsoleExtensions()
   return (
     <BreadcrumbProvider>
       <SidebarProvider>
@@ -330,6 +388,9 @@ const FullAppRoutes = () => {
           >
             <div className="h-full overflow-y-auto py-2 px-0 sm:p-4">
               <Routes>
+                {extraRoutes?.map((r) => (
+                  <Route key={r.path} path={r.path} element={r.element} />
+                ))}
                 <Route path="/" element={<Navigate to="/projects" replace />} />
                 <Route path="/dashboard" element={<Navigate to="/projects" replace />} />
                 <Route path="/account" element={<Account />} />
@@ -363,6 +424,12 @@ const FullAppRoutes = () => {
                   <Route path="notifications" element={<Notifications />} />
                   <Route path="users" element={<Users />} />
                   <Route path="users/:userId" element={<UserDetail />} />
+                  <Route path="auth" element={<AuthSettingsPage />} />
+                  <Route path="auth/new" element={<CreateOidcProviderPage />} />
+                  <Route
+                    path="auth/providers/:providerId"
+                    element={<OidcProviderDetailPage />}
+                  />
                   <Route path="keys" element={<ApiKeys />} />
                   <Route path="keys/new" element={<ApiKeyCreate />} />
                   <Route path="keys/:id" element={<ApiKeyDetail />} />
@@ -374,6 +441,8 @@ const FullAppRoutes = () => {
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="rate-limiting" element={<RateLimitingPage />} />
                   <Route path="disk-monitoring" element={<DiskMonitoringPage />} />
+                  <Route path="build-limits" element={<BuildLimitsPage />} />
+                  <Route path="metrics-monitoring" element={<MetricsMonitoringPage />} />
                   <Route path="nodes" element={<NodesPage />} />
                   <Route path="nodes/:nodeId" element={<NodeDetailPage />} />
                   <Route path="plugins" element={<PluginsPage />} />
@@ -386,6 +455,7 @@ const FullAppRoutes = () => {
                 <Route path="/storage/create" element={<CreateService />} />
                 <Route path="/storage/import" element={<ImportService />} />
                 <Route path="/storage/:id" element={<ServiceDetail />} />
+                <Route path="/storage/:id/monitoring" element={<ServiceMonitoring />} />
                 <Route path="/storage/:id/browse" element={<ServiceDataBrowser />} />
                 <Route path="/storage/:id/restore" element={<ServiceRestore />} />
                 <Route path="/storage/:id/upgrades/:upgradeId" element={<MajorUpgradeDetail />} />
@@ -414,8 +484,12 @@ const FullAppRoutes = () => {
                 <Route path="/dns-providers/:id" element={<DnsProviderDetail />} />
                 <Route path="/backups" element={<Backups />} />
                 <Route path="/backups/s3-sources/new" element={<CreateS3Source />} />
-                <Route path="/backups/s3-sources/:id" element={<S3SourceDetail />} />
+                <Route path="/backups/s3-sources/:id/schedules/new" element={<CreateBackupSchedule />} />
+                <Route path="/backups/s3-sources/:id/schedules/:scheduleId/edit" element={<EditBackupSchedule />} />
+                <Route path="/backups/schedules/:id" element={<ScheduleDetail />} />
+                <Route path="/backups/schedules/:scheduleId/runs/:runId" element={<ScheduleRunDetail />} />
                 <Route path="/backups/s3-sources/:id/backups/:backupId" element={<BackupDetail />} />
+                <Route path="/backups/s3-sources/:id" element={<S3SourceDetail />} />
                 {/* Backward-compat: old /settings/<resource> links → new top-level */}
                 <Route path="/settings/domains/*" element={<Navigate to="/domains" replace />} />
                 <Route path="/settings/email/*" element={<Navigate to="/email" replace />} />
@@ -470,6 +544,11 @@ const AppContent = () => {
               <Routes>
                 {/* Public routes that don't require authentication */}
                 <Route path="/mfa-verify" element={<MfaVerify />} />
+                <Route path="/forgot-password" element={<ForgotPassword />} />
+                {/* Target of the password-reset email link
+                    ({base_url}/auth/reset-password?token=...) — see
+                    send_password_reset_email in temps-auth. */}
+                <Route path="/auth/reset-password" element={<ResetPassword />} />
 
                 {/* Protected routes - layout determined by demo mode */}
                 <Route
@@ -532,12 +611,24 @@ const queryClient = new QueryClient({
 })
 client.setConfig({ baseUrl: '/api' })
 
-const App = () => {
+export interface TempsConsoleProps {
+  extensions?: ConsoleExtensions
+  baseUrl?: string
+}
+
+export const TempsConsole = ({
+  extensions,
+  baseUrl = '/api',
+}: TempsConsoleProps) => {
+  client.setConfig({ baseUrl })
+
   return (
     <ThemeProvider defaultTheme="system" enableSystem attribute="class">
       <ThemeWrapper>
         <QueryClientProvider client={queryClient}>
-          <AppContent />
+          <ConsoleExtensionsProvider extensions={extensions}>
+            <AppContent />
+          </ConsoleExtensionsProvider>
         </QueryClientProvider>
         <Toaster position="top-center" />
       </ThemeWrapper>
@@ -545,4 +636,4 @@ const App = () => {
   )
 }
 
-export default App
+export default TempsConsole

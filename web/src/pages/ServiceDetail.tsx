@@ -4,14 +4,14 @@ import {
   getServiceOptions,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
-  listS3SourcesOptions,
   listServiceProjectsOptions,
-  listSourceBackupsOptions,
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { SourceBackupEntry } from '@/api/client/types.gen'
+import { cn } from '@/lib/utils'
+import { listExternalServiceBackupsOptions } from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
+import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
@@ -19,6 +19,7 @@ import {
   ServiceHealthBadge,
   ServiceHealthCard,
 } from '@/components/storage/ServiceHealthCard'
+import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
 import { listPgUpgrades, phaseIndex, PG_UPGRADE_PHASES, isTerminal } from '@/lib/pg-upgrades'
@@ -61,9 +62,9 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { maskValue, shouldMaskValue } from '@/lib/masking'
 import { formatBytes } from '@/lib/utils'
+import { iconForServiceType } from '@/lib/serviceIcons'
 import {
   useMutation,
-  useQueries,
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query'
@@ -76,12 +77,14 @@ import {
 } from '@/components/ui/dropdown-menu'
 import {
   AlertCircle,
+  Activity,
   ArrowLeft,
   ArrowUpCircle,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  Clock,
   Database,
-  DatabaseBackup,
   Eye,
   EyeOff,
   HardDrive,
@@ -89,11 +92,14 @@ import {
   MoreVertical,
   Pencil,
   Plus,
+  Radio,
   RefreshCcw,
   RotateCcw,
   Server,
   Trash2,
+  XCircle,
 } from 'lucide-react'
+import { format } from 'date-fns'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -116,6 +122,26 @@ import { toast } from 'sonner'
  *     to stored `role` so the UI doesn't suddenly say "replica" for
  *     every node when the monitor blips
  */
+/**
+ * Compact wall-clock duration: `<1s`, `42s`, `1m 5s`, `2h 13m`.
+ * Sub-second durations render as `<1s` so a backup that legitimately
+ * finished doesn't look like a zero-duration ghost row.
+ */
+function formatShortDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '<1s'
+  const seconds = Math.floor(ms / 1000)
+  if (seconds === 0) return '<1s'
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const remSeconds = seconds % 60
+  if (minutes < 60) {
+    return remSeconds ? `${minutes}m ${remSeconds}s` : `${minutes}m`
+  }
+  const hours = Math.floor(minutes / 60)
+  const remMinutes = minutes % 60
+  return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`
+}
+
 function memberDisplayRole(member: {
   role: string
   live_state?: string | null
@@ -216,51 +242,27 @@ export function ServiceDetail() {
     ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
   })
 
-  // Backups that belong to this service. We pull the S3 source list and then
-  // fan out to each source's backup index; entries whose origin service name
-  // matches this service are surfaced in the Backups card below.
-  const serviceName = service?.service?.name
-  const { data: s3Sources } = useQuery({
-    ...listS3SourcesOptions(),
-    enabled: !!serviceName,
-  })
-
-  const sourceBackupQueries = useQueries({
-    queries: (s3Sources || []).map((source) => ({
-      ...listSourceBackupsOptions({ path: { id: source.id } }),
-      enabled: !!serviceName,
-    })),
-  })
-
-  const isLoadingBackups =
-    !!serviceName &&
-    (s3Sources === undefined ||
-      sourceBackupQueries.some((q) => q.isLoading))
-
-  const serviceBackups = useMemo(() => {
-    if (!serviceName || !s3Sources) return []
-    const rows: Array<SourceBackupEntry & { source_id: number; source_name: string }> = []
-    sourceBackupQueries.forEach((q, idx) => {
-      const source = s3Sources[idx]
-      if (!source || !q.data) return
-      for (const entry of q.data.backups) {
-        if (entry.origin_service_name === serviceName) {
-          rows.push({ ...entry, source_id: source.id, source_name: source.name })
-        }
-      }
-    })
-    rows.sort(
-      (a, b) =>
-        new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-    )
-    return rows
-  }, [serviceName, s3Sources, sourceBackupQueries])
-
-  const BACKUPS_PAGE_SIZE = 5
+  // Backups for this service — single DB-only query, no S3 fan-out.
+  // Replaces the previous multi-source fan-out that issued one slow S3 scan
+  // per configured source on every page load.
+  const serviceId = id ? parseInt(id) : undefined
   const [backupsPage, setBackupsPage] = useState(1)
+  const BACKUPS_PAGE_SIZE = 5
+
+  const {
+    data: serviceBackupsData,
+    isLoading: isLoadingBackups,
+    isFetching: isFetchingBackups,
+    refetch: refetchBackups,
+  } = useQuery({
+    ...listExternalServiceBackupsOptions(serviceId, backupsPage, BACKUPS_PAGE_SIZE),
+    enabled: !!serviceId,
+  })
+
+  const serviceBackups = serviceBackupsData?.backups ?? []
   const backupsTotalPages = Math.max(
     1,
-    Math.ceil(serviceBackups.length / BACKUPS_PAGE_SIZE),
+    Math.ceil((serviceBackupsData?.total ?? 0) / BACKUPS_PAGE_SIZE),
   )
 
   useEffect(() => {
@@ -269,14 +271,7 @@ export function ServiceDetail() {
     }
   }, [backupsPage, backupsTotalPages])
 
-  const paginatedBackups = useMemo(
-    () =>
-      serviceBackups.slice(
-        (backupsPage - 1) * BACKUPS_PAGE_SIZE,
-        backupsPage * BACKUPS_PAGE_SIZE,
-      ),
-    [serviceBackups, backupsPage],
-  )
+  const paginatedBackups = serviceBackups
 
   const backupsPageWindow = useMemo(() => {
     const windowSize = Math.min(5, backupsTotalPages)
@@ -305,7 +300,7 @@ export function ServiceDetail() {
   useEffect(() => {
     if (service) {
       setBreadcrumbs([
-        { label: 'Storage', href: '/storage' },
+        { label: 'Databases', href: '/storage' },
         {
           label: service.service.name || 'Service Details',
           href: `/storage/${id}`,
@@ -313,7 +308,7 @@ export function ServiceDetail() {
       ])
     } else {
       setBreadcrumbs([
-        { label: 'Storage', href: '/storage' },
+        { label: 'Databases', href: '/storage' },
         { label: 'Service Details', href: `/storage/${id}` },
       ])
     }
@@ -497,7 +492,20 @@ export function ServiceDetail() {
     if (service.service.status === 'running') {
       setIsStopDialogOpen(true)
     } else if (service.service.status === 'stopped') {
-      startService.mutate({ path: { id: parseInt(id!) } })
+      // Start can take 5–15s for Postgres (reconcile + recreate path).
+      // toast.promise surfaces all three states without blocking the UI,
+      // matching the rollback/promote patterns elsewhere in the app.
+      toast.promise(
+        startService.mutateAsync({ path: { id: parseInt(id!) } }),
+        {
+          loading: `Starting ${service.service.name}…`,
+          success: `${service.service.name} started`,
+          error: (err: Error) =>
+            err?.message
+              ? `Failed to start ${service.service.name}: ${err.message}`
+              : `Failed to start ${service.service.name}`,
+        }
+      )
     }
   }
 
@@ -515,7 +523,7 @@ export function ServiceDetail() {
   if (isLoading) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="sm:p-4 space-y-6 md:p-6">
+        <div className="p-4 space-y-6 md:p-6">
           <div className="h-8 w-32 bg-muted rounded animate-pulse" />
           <Card>
             <CardHeader>
@@ -539,7 +547,7 @@ export function ServiceDetail() {
   if (queryError || !service) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="sm:p-4 space-y-6 md:p-6">
+        <div className="p-4 space-y-6 md:p-6">
           <div className="flex flex-col items-center justify-center py-12 text-center">
             <p className="text-sm text-muted-foreground mb-4">
               Failed to load service details
@@ -560,7 +568,7 @@ export function ServiceDetail() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="sm:p-4 space-y-6 md:p-6">
+      <div className="p-4 space-y-6 md:p-6">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
             <Link to="/storage">
@@ -612,7 +620,7 @@ export function ServiceDetail() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2 self-start sm:self-auto">
+          <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the
@@ -629,7 +637,8 @@ export function ServiceDetail() {
                     <Loader2 className="h-3 w-3 animate-spin" />
                   ) : (
                     <>
-                      {linkedProjectsResponse?.length || 0} linked
+                      <span className="hidden sm:inline">{linkedProjectsResponse?.length || 0} linked</span>
+                      <span className="sm:hidden">{linkedProjectsResponse?.length || 0}</span>
                     </>
                   )}
                 </Button>
@@ -638,6 +647,13 @@ export function ServiceDetail() {
                 <div className="border-b p-3">
                   <p className="text-xs font-medium text-muted-foreground">
                     Linked projects
+                  </p>
+                  <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                    Linking creates a dedicated{' '}
+                    <code className="rounded bg-muted px-1 py-0.5 font-mono">
+                      {'<project>_<env>'}
+                    </code>{' '}
+                    database per environment. No extra services are spun up.
                   </p>
                   {linkedProjectsLoading ? (
                     <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
@@ -702,10 +718,18 @@ export function ServiceDetail() {
               </PopoverContent>
             </Popover>
 
+            {service.service.status === 'running' && (
+              <Link to={`/storage/${id}/monitoring`}>
+                <Button variant="outline" size="sm" className="gap-2">
+                  <Activity className="h-4 w-4" />
+                  <span className="hidden sm:inline">Monitoring</span>
+                </Button>
+              </Link>
+            )}
             <Link to={`/storage/${id}/browse`}>
               <Button variant="outline" size="sm" className="gap-2">
                 <Database className="h-4 w-4" />
-                Browse Data
+                <span className="hidden sm:inline">Browse Data</span>
               </Button>
             </Link>
             <DropdownMenu>
@@ -797,6 +821,29 @@ export function ServiceDetail() {
           {service.service.status === 'running' ? (
             <ServiceHealthCard serviceId={parseInt(id!)} />
           ) : null}
+
+          {/*
+            Postgres-only WAL bloat / archive misconfiguration surface. Renders
+            nothing when there are no warnings, so it's safe to mount
+            unconditionally for non-Postgres services (the component itself
+            checks the type and bails before fetching).
+          */}
+          {service.service.status === 'running' ? (
+            <WalHealthPanel
+              serviceId={parseInt(id!)}
+              serviceType={service.service.service_type}
+            />
+          ) : null}
+
+          {service.service.status === 'running' && (
+            <MonitoringCard
+              serviceId={service.service.id}
+              engine={service.service.service_type}
+              dockerImage={service.current_parameters?.docker_image ?? undefined}
+              metricsEnabled={service.service.metrics_enabled ?? false}
+              onMonitoringChange={() => refetch()}
+            />
+          )}
 
           {/* Cluster Creation Progress */}
           {service.service.topology === 'cluster' &&
@@ -1138,15 +1185,15 @@ export function ServiceDetail() {
           {/* Backups Section */}
           <Card>
             <CardHeader>
-              <div className="flex items-start justify-between gap-3">
-                <div className="space-y-1.5">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="space-y-1.5 min-w-0">
                   <CardTitle className="flex items-center gap-2">
                     <span>Backups</span>
                     <Badge variant="outline">
                       {isLoadingBackups ? (
                         <Loader2 className="h-3 w-3 animate-spin" />
                       ) : (
-                        serviceBackups.length
+                        serviceBackupsData?.total ?? 0
                       )}
                     </Badge>
                   </CardTitle>
@@ -1154,15 +1201,34 @@ export function ServiceDetail() {
                     Backups of this service stored across your S3 sources
                   </CardDescription>
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="gap-2"
-                  onClick={() => setIsBackupDialogOpen(true)}
-                >
-                  <HardDrive className="h-4 w-4" />
-                  Trigger backup
-                </Button>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9"
+                    aria-label="Refresh backups"
+                    title="Refresh backups"
+                    onClick={() => void refetchBackups()}
+                    disabled={isFetchingBackups}
+                  >
+                    <RefreshCcw
+                      className={cn(
+                        'h-4 w-4',
+                        isFetchingBackups && 'animate-spin',
+                      )}
+                    />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="gap-2"
+                    onClick={() => setIsBackupDialogOpen(true)}
+                  >
+                    <HardDrive className="h-4 w-4" />
+                    <span className="hidden sm:inline">Trigger backup</span>
+                    <span className="sm:hidden">Backup</span>
+                  </Button>
+                </div>
               </div>
             </CardHeader>
             <CardContent>
@@ -1181,60 +1247,151 @@ export function ServiceDetail() {
               ) : (
                 <ul role="list" className="divide-y divide-border">
                   {paginatedBackups.map((backup) => {
-                    const key = backup.backup_id || `${backup.source_id}-${backup.location}`
-                    const isFailed = backup.state === 'failed'
-                    const isRunning = backup.state === 'running'
+                    const key =
+                      backup.backup_id || String(backup.external_service_backup_id)
+                    const state = backup.state || 'unknown'
+                    const isCompleted = state === 'completed'
+                    const isFailed = state === 'failed'
+                    const isRunning = state === 'running' || state === 'pending'
+
+                    // Duration only when we have both endpoints. Sub-second
+                    // backups render as `<1s` rather than `0s` so the user
+                    // sees "yes, it really did finish".
+                    const startedMs = new Date(backup.started_at).getTime()
+                    const finishedMs = backup.finished_at
+                      ? new Date(backup.finished_at).getTime()
+                      : null
+                    const durationLabel =
+                      finishedMs && finishedMs > startedMs
+                        ? formatShortDuration(finishedMs - startedMs)
+                        : null
+
+                    const linkTo = backup.backup_id
+                      ? `/backups/s3-sources/${backup.s3_source_id}/backups/${backup.backup_id}`
+                      : `/backups/s3-sources/${backup.s3_source_id}`
+
+                    // All backups in this list belong to the current
+                    // service, so the icon is the service type (postgres
+                    // -> Database, mongodb -> Leaf, redis -> Server, …).
+                    // Using `service.service.service_type` directly keeps
+                    // the row in lock-step with the page header even when
+                    // the backend hasn't surfaced an `engine` field on
+                    // this entry yet (legacy rows).
+                    const ServiceIcon = iconForServiceType(
+                      service.service.service_type,
+                    )
+
                     return (
-                      <li
-                        key={key}
-                        className="flex items-center gap-4 py-3"
-                      >
-                        <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
-                          <DatabaseBackup className="size-4 text-muted-foreground" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <p className="truncate text-sm font-medium">
-                              <TimeAgo date={backup.created_at} />
-                            </p>
-                            {backup.backup_type && (
-                              <Badge variant="outline" className="text-xs">
-                                {backup.backup_type}
-                              </Badge>
-                            )}
-                            {isRunning && (
-                              <Badge variant="secondary" className="gap-1 text-xs">
-                                <Loader2 className="h-3 w-3 animate-spin" />
-                                Running
-                              </Badge>
-                            )}
-                            {isFailed && (
-                              <Badge variant="destructive" className="text-xs">
-                                Failed
-                              </Badge>
-                            )}
-                            {backup.source === 's3_scan' && (
-                              <Badge variant="secondary" className="text-xs">
-                                External
-                              </Badge>
-                            )}
-                          </div>
-                          <p className="mt-0.5 truncate text-xs text-muted-foreground tabular-nums">
-                            {backup.source_name}
-                            {backup.size_bytes
-                              ? ` · ${formatBytes(backup.size_bytes)}`
-                              : ''}
-                            {backup.format ? ` · ${backup.format}` : ''}
-                          </p>
-                        </div>
+                      <li key={key}>
                         <Link
-                          to={
-                            backup.backup_id
-                              ? `/backups/s3-sources/${backup.source_id}/backups/${backup.backup_id}`
-                              : `/backups/s3-sources/${backup.source_id}`
-                          }
+                          to={linkTo}
+                          className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md sm:gap-4 -mx-2 px-2"
                         >
-                          <Button variant="ghost" size="sm" className="gap-2">
+                          <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
+                            <ServiceIcon className="size-4 text-muted-foreground" />
+                          </div>
+
+                          {/* Title + meta. Lead with the human-readable
+                              service/source line, secondary line packs the
+                              actionable detail (exact time, duration, size,
+                              short UUID, error preview). */}
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                              <p className="truncate text-sm font-medium">
+                                <TimeAgo date={backup.started_at} />
+                              </p>
+                              <span
+                                className="hidden text-xs text-muted-foreground sm:inline"
+                                aria-hidden
+                              >
+                                ·
+                              </span>
+                              <span className="font-mono text-xs text-muted-foreground tabular-nums hidden sm:inline">
+                                {format(
+                                  new Date(backup.started_at),
+                                  'MMM d, p',
+                                )}
+                              </span>
+                              {backup.backup_type ? (
+                                <Badge variant="outline" className="text-xs">
+                                  {backup.backup_type}
+                                </Badge>
+                              ) : null}
+                              {isCompleted ? (
+                                <Badge
+                                  variant="outline"
+                                  className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                                >
+                                  <CheckCircle2 className="h-3 w-3" />
+                                  Completed
+                                </Badge>
+                              ) : isRunning ? (
+                                <Badge
+                                  variant="secondary"
+                                  className="gap-1 text-xs"
+                                >
+                                  <Radio className="h-3 w-3 animate-pulse" />
+                                  {state === 'pending' ? 'Pending' : 'Running'}
+                                </Badge>
+                              ) : isFailed ? (
+                                <Badge variant="destructive" className="gap-1 text-xs">
+                                  <XCircle className="h-3 w-3" />
+                                  Failed
+                                </Badge>
+                              ) : (
+                                <Badge variant="outline" className="text-xs">
+                                  {state}
+                                </Badge>
+                              )}
+                            </div>
+                            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
+                              <span className="truncate">
+                                {backup.s3_source_name}
+                              </span>
+                              {backup.size_bytes && backup.size_bytes > 0 ? (
+                                <span className="inline-flex items-center gap-1">
+                                  <HardDrive className="h-3 w-3" />
+                                  {formatBytes(backup.size_bytes)}
+                                </span>
+                              ) : null}
+                              {durationLabel ? (
+                                <span className="inline-flex items-center gap-1">
+                                  <Clock className="h-3 w-3" />
+                                  {durationLabel}
+                                </span>
+                              ) : null}
+                              {backup.backup_id ? (
+                                <span className="font-mono">
+                                  #{backup.backup_id.slice(0, 8)}
+                                </span>
+                              ) : null}
+                            </div>
+                            {/* Error preview — only when the backup actually
+                                failed. Hard-caps the rendered string at ~160
+                                chars and clips with CSS `truncate` so a long
+                                stack trace can't blow out the card width even
+                                if a parent flex container forgets `min-w-0`.
+                                Full message is on the BackupDetail page (and
+                                surfaced via `title` on hover). */}
+                            {isFailed && backup.error_message ? (
+                              <p
+                                className="mt-1 truncate text-xs text-destructive"
+                                title={backup.error_message}
+                              >
+                                {backup.error_message.length > 160
+                                  ? `${backup.error_message.slice(0, 160)}…`
+                                  : backup.error_message}
+                              </p>
+                            ) : null}
+                          </div>
+
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="hidden gap-2 sm:flex"
+                            tabIndex={-1}
+                            asChild={false}
+                          >
                             View
                             <ArrowLeft className="h-4 w-4 rotate-180" />
                           </Button>
@@ -1251,9 +1408,9 @@ export function ServiceDetail() {
                       Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
                       {Math.min(
                         backupsPage * BACKUPS_PAGE_SIZE,
-                        serviceBackups.length,
+                        serviceBackupsData?.total ?? 0,
                       )}{' '}
-                      of {serviceBackups.length} backups
+                      of {serviceBackupsData?.total ?? 0} backups
                     </span>
                     <span className="sm:hidden tabular-nums">
                       {backupsPage} / {backupsTotalPages}
@@ -1607,6 +1764,7 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         currentImage={service.current_parameters?.docker_image || undefined}
         serviceType={service.service.service_type}
+        onSuccess={() => refetch()}
       />
 
       <MajorUpgradeDialog

@@ -257,6 +257,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             post(trigger_service_health_check),
         )
         .route(
+            "/external-services/{id}/wal-health",
+            get(get_postgres_wal_health),
+        )
+        .route(
             "/external-services/health-status-batch",
             get(list_service_health_statuses),
         )
@@ -320,6 +324,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             patch(update_service_resources),
         )
         .merge(super::query_handlers::configure_query_routes())
+        .merge(super::metrics_handlers::configure_metrics_routes())
 }
 
 /// Get parameter schema for a specific service type
@@ -953,6 +958,57 @@ async fn trigger_service_health_check(
         }
         Err(e) => Err(internal_server_error()
             .detail(format!("Failed to load service health: {}", e))
+            .build()),
+    }
+}
+
+/// Postgres WAL & archive health snapshot
+///
+/// Returns the latest WAL/archive health snapshot recorded by the background
+/// health monitor for a Postgres external service. Powers the warning banner
+/// on the service detail page when the disk is filling up due to stale
+/// replication slots, archive backlog, or misconfigured `archive_command`.
+///
+/// Returns 404 when no snapshot exists yet (probe hasn't run, or the service
+/// isn't Postgres).
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/wal-health",
+    operation_id = "getPostgresWalHealth",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Latest WAL health snapshot", body = crate::externalsvc::postgres_wal_health::PostgresWalHealth),
+        (status = 404, description = "Service not found, or no WAL snapshot available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID"),
+    )
+)]
+async fn get_postgres_wal_health(
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    match app_state
+        .external_service_manager
+        .get_postgres_wal_health(id)
+        .await
+    {
+        Ok(Some(snapshot)) => Ok((StatusCode::OK, Json(snapshot))),
+        Ok(None) => Err(not_found()
+            .detail(format!(
+                "No WAL health snapshot available for service {}",
+                id
+            ))
+            .build()),
+        Err(crate::services::ExternalServiceError::ServiceNotFound { .. }) => {
+            Err(not_found().detail("Service not found").build())
+        }
+        Err(e) => Err(internal_server_error()
+            .detail(format!("Failed to load WAL health: {}", e))
             .build()),
     }
 }
@@ -2204,6 +2260,7 @@ async fn update_service_resources(
         get_service_by_slug,
         get_service_health_status,
         trigger_service_health_check,
+        get_postgres_wal_health,
         list_service_health_statuses,
         get_cluster_health,
         get_service_runtime,
@@ -2217,6 +2274,19 @@ async fn update_service_resources(
         super::query_handlers::get_entity_info,
         super::query_handlers::query_data,
         super::query_handlers::download_object,
+        super::metrics_handlers::get_service_metrics_range,
+        super::metrics_handlers::get_service_metrics_latest,
+        super::metrics_handlers::get_service_metrics_status,
+        super::metrics_handlers::get_service_metrics_by_database,
+        super::metrics_handlers::list_service_alert_rules,
+        super::metrics_handlers::create_service_alert_rule,
+        super::metrics_handlers::update_service_alert_rule,
+        super::metrics_handlers::delete_service_alert_rule,
+        super::metrics_handlers::toggle_service_metrics,
+        super::metrics_handlers::get_deployment_metrics_range,
+        super::metrics_handlers::get_deployment_metrics_latest,
+        super::metrics_handlers::toggle_deployment_metrics,
+        super::metrics_handlers::get_node_metrics_range,
     ),
     components(schemas(
         ServiceTypeInfo,
@@ -2243,6 +2313,11 @@ async fn update_service_resources(
         ClusterHealthReportResponse,
         ClusterMemberHealthResponse,
         crate::externalsvc::ServiceResourceLimits,
+        crate::externalsvc::postgres_wal_health::PostgresWalHealth,
+        crate::externalsvc::postgres_wal_health::ArchiveMode,
+        crate::externalsvc::postgres_wal_health::StaleSlot,
+        crate::externalsvc::postgres_wal_health::WalWarning,
+        crate::externalsvc::postgres_wal_health::WalWarningSeverity,
         crate::services::ContainerRuntimeInfo,
         crate::services::ServiceRuntimeReport,
         crate::services::ContainerStatsSample,
@@ -2258,6 +2333,16 @@ async fn update_service_resources(
         super::query_handlers::FieldResponse,
         super::query_handlers::QueryDataRequest,
         super::query_handlers::QueryDataResponse,
+        super::metrics_handlers::MetricDataPoint,
+        super::metrics_handlers::MetricsRangeQuery,
+        super::metrics_handlers::MetricsStatusResponse,
+        super::metrics_handlers::DatabaseMetricsRow,
+        super::metrics_handlers::DatabaseMetricsResponse,
+        super::metrics_handlers::AlertRuleResponse,
+        super::metrics_handlers::CreateAlertRuleRequest,
+        super::metrics_handlers::UpdateAlertRuleRequest,
+        super::metrics_handlers::ToggleServiceMetricsRequest,
+        super::metrics_handlers::ToggleDeploymentMetricsRequest,
     )),
     info(
         title = "External Services API",
@@ -2268,7 +2353,8 @@ async fn update_service_resources(
     ),
     tags(
         (name = "External Services", description = "External service integration endpoints"),
-        (name = "External Services - Query", description = "Data querying and exploration endpoints")
+        (name = "External Services - Query", description = "Data querying and exploration endpoints"),
+        (name = "Metrics", description = "Time-series metrics and alert rule endpoints")
     )
 )]
 pub struct ExternalServiceApiDoc;

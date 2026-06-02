@@ -49,6 +49,22 @@ pub struct ServerConfig {
     pub tls_address: Option<String>,
     pub console_address: String,
 
+    // Admin listener (optional). When set, admin/management routes bind here
+    // while the `console_address` listener only serves public ingest routes
+    // (analytics events, error tracking ingest, AI gateway, worker route sync,
+    // etc.). When unset, both surfaces share `console_address` for backwards
+    // compatibility. See [admin-listener-split] for the route classification.
+    pub console_admin_address: Option<String>,
+    /// Comma-separated list of IPs / CIDRs allowed to reach the admin listener.
+    /// Empty / unset = no IP allowlist (admin gated only by binding address).
+    pub admin_allowed_ips: Vec<String>,
+    /// Comma-separated list of HTTP Host headers allowed on the admin listener.
+    /// Empty / unset = no Host check.
+    pub admin_allowed_hosts: Vec<String>,
+    /// When true, honor `X-Forwarded-For` from loopback peers only (for
+    /// reverse-proxy deployments). Defaults to false.
+    pub admin_trust_forwarded_for: bool,
+
     // Generated/derived fields
     pub data_dir: PathBuf,
     pub auth_secret: String,
@@ -119,11 +135,48 @@ impl ServerConfig {
         // Get console address - use a random available port
         let console_address = console_address.unwrap_or_else(Self::get_random_console_address);
 
+        // Admin listener (opt-in). When unset, the existing single-listener
+        // mode is used and every route binds to `console_address`.
+        let console_admin_address = std::env::var("TEMPS_CONSOLE_ADMIN_ADDRESS")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let admin_allowed_ips = std::env::var("TEMPS_ADMIN_ALLOWED_IPS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let admin_allowed_hosts = std::env::var("TEMPS_ADMIN_ALLOWED_HOSTS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let admin_trust_forwarded_for = std::env::var("TEMPS_ADMIN_TRUST_FORWARDED_FOR")
+            .ok()
+            .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
         Ok(ServerConfig {
             address,
             database_url,
             tls_address,
             console_address,
+            console_admin_address,
+            admin_allowed_ips,
+            admin_allowed_hosts,
+            admin_trust_forwarded_for,
             data_dir,
             auth_secret,
             encryption_key,
@@ -267,6 +320,33 @@ impl ConfigService {
     /// Get the base data directory path
     pub fn data_dir(&self) -> PathBuf {
         PathBuf::from(self.config.get_data_dir())
+    }
+
+    /// Parse the port from the main proxy listener address (`host:port`).
+    ///
+    /// Internal container traffic (OTLP metrics, agent callbacks) goes through
+    /// the Pingora proxy on this port — the proxy routes `/api/*` to the
+    /// console/API listener via a path rule. This is the conventional single
+    /// public port operators expose. Falls back to 8080 if unparsable.
+    pub fn proxy_port(&self) -> u16 {
+        self.config
+            .address
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(8080)
+    }
+
+    /// Resolve the internal URL service containers use to reach the Temps API
+    /// from inside the Docker network. Reads the `internal_url` setting from
+    /// the DB, falling back to `TEMPS_INTERNAL_API_URL` then
+    /// `http://host.docker.internal:{proxy_port}`. No trailing slash.
+    pub async fn resolve_internal_url(&self) -> String {
+        let port = self.proxy_port();
+        match self.get_settings().await {
+            Ok(settings) => settings.resolve_internal_url(port),
+            Err(_) => AppSettings::default().resolve_internal_url(port),
+        }
     }
 
     /// Get the static files directory path (always under data_dir/static)

@@ -1,15 +1,18 @@
+use crate::client_ip::resolve_client_ip;
 use crate::permissions::Role;
 use crate::{
     auth_service::AuthService, context::AuthContext, user_service::UserService, AuthState,
 };
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
 };
 use cookie::Cookie;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use temps_core::{CookieCrypto, RequestMetadata};
+use tracing::warn;
 
 // Cookie names from proxy
 const SESSION_ID_COOKIE_NAME: &str = "_temps_sid";
@@ -66,15 +69,17 @@ pub async fn auth_middleware(
     let base_url = format!("{}://{}", scheme, raw_host);
     let host = temps_core::host_without_port(&raw_host).to_string();
 
+    // Extract the direct TCP peer address so we can decide whether to trust
+    // proxy headers. ConnectInfo is inserted by Axum when the listener is
+    // configured with `into_make_service_with_connect_info`.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+
     // Create RequestMetadata
     let metadata = RequestMetadata {
-        ip_address: req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .unwrap_or("unknown")
-            .to_string(),
+        ip_address: resolve_client_ip(req.headers(), peer),
         user_agent: req
             .headers()
             .get("user-agent")
@@ -120,30 +125,59 @@ pub async fn extract_auth_from_request(
 
                 // Try API key first (they have a specific format: tk_...)
                 if token.starts_with("tk_") {
-                    if let Ok((user, role, permissions, key_name, key_id)) =
-                        api_key_service.validate_api_key(token).await
-                    {
-                        return Ok(AuthContext::new_api_key(
-                            user,
-                            role,
-                            permissions,
-                            key_name,
-                            key_id,
-                        ));
+                    match api_key_service.validate_api_key(token).await {
+                        Ok((user, role, permissions, key_name, key_id)) => {
+                            return Ok(AuthContext::new_api_key(
+                                user,
+                                role,
+                                permissions,
+                                key_name,
+                                key_id,
+                            ));
+                        }
+                        Err(e) => {
+                            // Logged so operators can tell `tk_` rejections from
+                            // `dt_` rejections in /tmp/temps-serve.log. We log
+                            // only the first 8 chars of the token (which is the
+                            // same prefix we'd compute from the plaintext anyway
+                            // and what shows up in DB rows), never the full
+                            // plaintext.
+                            warn!(
+                                token_prefix = %&token[..token.len().min(8)],
+                                "API key auth failed: {}",
+                                e
+                            );
+                        }
                     }
                 }
 
                 // Try deployment token (format: dt_...)
                 if token.starts_with("dt_") {
-                    if let Ok(validated) = deployment_token_service.validate_token(token).await {
-                        return Ok(AuthContext::new_deployment_token(
-                            validated.project_id,
-                            validated.environment_id,
-                            validated.deployment_id,
-                            validated.token_id,
-                            validated.name,
-                            validated.permissions,
-                        ));
+                    match deployment_token_service.validate_token(token).await {
+                        Ok(validated) => {
+                            return Ok(AuthContext::new_deployment_token(
+                                validated.project_id,
+                                validated.environment_id,
+                                validated.deployment_id,
+                                validated.token_id,
+                                validated.name,
+                                validated.permissions,
+                            ));
+                        }
+                        Err(e) => {
+                            // Critical for production debugging: without this
+                            // log, a deployed app holding a `dt_` token whose
+                            // DB row got deactivated / expired / rotated will
+                            // 401 forever with only the generic "Authentication
+                            // Required" message and no clue why. The token
+                            // prefix is non-sensitive (already stored in the
+                            // DB and shown in the UI).
+                            warn!(
+                                token_prefix = %&token[..token.len().min(8)],
+                                "Deployment token auth failed: {}",
+                                e
+                            );
+                        }
                     }
                 }
             }

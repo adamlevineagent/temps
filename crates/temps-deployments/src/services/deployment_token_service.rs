@@ -429,6 +429,38 @@ impl DeploymentTokenService {
         Ok(())
     }
 
+    /// Revoke a token immediately by setting its expiry to the current time.
+    ///
+    /// Used by the agent executor to invalidate run-scoped tokens the moment a
+    /// run completes, fails, or is cancelled, so that the remaining time in the
+    /// original expiry window cannot be exploited.
+    ///
+    /// Silently succeeds if the token does not exist — the caller (executor
+    /// cleanup) should not fail a completed run because revocation missed.
+    pub async fn revoke_token_by_id(
+        &self,
+        token_id: i32,
+    ) -> Result<(), DeploymentTokenServiceError> {
+        let token = DeploymentTokenEntity::find_by_id(token_id)
+            .one(self.db.as_ref())
+            .await?;
+
+        let Some(token) = token else {
+            // Already deleted or never existed — treat as success.
+            return Ok(());
+        };
+
+        let mut active: DeploymentTokenActiveModel = token.into();
+        // Set expires_at to now() so every subsequent validate_token call
+        // hits the "token has expired" branch and returns Unauthorized.
+        active.expires_at = Set(Some(Utc::now()));
+        active.is_active = Set(false);
+        active.updated_at = Set(Utc::now());
+        active.update(self.db.as_ref()).await?;
+
+        Ok(())
+    }
+
     /// Validate a deployment token and return project info and permissions
     /// Returns (project_id, environment_id, permissions)
     pub async fn validate_token(
@@ -520,13 +552,24 @@ impl DeploymentTokenService {
                 query.filter(temps_entities::deployment_tokens::Column::EnvironmentId.is_null());
         }
 
-        // Check expiration
-        let now = Utc::now();
-        query = query.filter(
-            temps_entities::deployment_tokens::Column::ExpiresAt
-                .is_null()
-                .or(temps_entities::deployment_tokens::Column::ExpiresAt.gt(now)),
-        );
+        // Only reuse PERMANENT tokens (expires_at IS NULL).
+        //
+        // The deploy pipeline burns this token into the container's
+        // `TEMPS_API_TOKEN` env var at create time. That value never gets
+        // refreshed for the life of the container, so the token has to
+        // outlive every redeploy of every app in the project.
+        //
+        // Previously the filter was `is_null().or(gt(now))`, which happily
+        // returned short-lived tokens (`workflow-run-*` with 2h expiry,
+        // `workspace-session-*` with 6h expiry) as long as they hadn't
+        // expired YET. Containers deployed during one of those windows got
+        // a token that died a couple hours later and 401'd ever after.
+        //
+        // Restricting to `expires_at IS NULL` means we only reuse tokens we
+        // ourselves auto-generated for the deploy path below — those are
+        // the only ones that ever carry no expiry. Anything else falls
+        // through to the create branch and we mint a fresh permanent row.
+        query = query.filter(temps_entities::deployment_tokens::Column::ExpiresAt.is_null());
 
         // Order by: prefer environment-specific tokens, then by creation date
         query = query
@@ -1458,5 +1501,170 @@ mod tests {
         // Note: DeploymentTokenResponse doesn't have a `token` field - only token_prefix
         assert!(response.token_prefix.ends_with("..."));
         assert_eq!(response.permissions.as_ref().unwrap().len(), 2);
+    }
+
+    /// Regression test for the production bug where the deploy pipeline got
+    /// handed a short-lived `workflow-run-*` token instead of a permanent
+    /// one. The container baked the expiring token into TEMPS_API_TOKEN at
+    /// create time, then 401'd every API call once the token's 2h window
+    /// closed.
+    ///
+    /// `get_or_create_deployment_token` MUST skip any row with a non-NULL
+    /// `expires_at`, even if that row hasn't expired yet — those rows
+    /// belong to other subsystems (workflow runs, workspace sessions) and
+    /// are not intended for the deploy pipeline.
+    #[tokio::test]
+    async fn test_get_or_create_skips_short_lived_tokens() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        // Seed an active, non-expired, short-lived token that mimics a
+        // workflow-run token (2h expiry, future).
+        let short_lived = service
+            .create_token(
+                project.id,
+                Some(1),
+                CreateDeploymentTokenRequest {
+                    name: "workflow-run-fake-1".to_string(),
+                    environment_id: None,
+                    deployment_id: None,
+                    permissions: Some(vec!["*".to_string()]),
+                    expires_at: Some(Utc::now() + Duration::hours(2)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Now ask the deploy pipeline's helper for a token.
+        let returned = service
+            .get_or_create_deployment_token(project.id, None, None)
+            .await
+            .unwrap();
+
+        // The short-lived row's plaintext is in `short_lived.token`. The
+        // returned token must NOT equal it — the function should have
+        // fallen through to the create branch and minted a fresh
+        // permanent row.
+        assert_ne!(
+            returned, short_lived.token,
+            "deploy pipeline reused a short-lived (expiring) token — would 401 after expiry"
+        );
+
+        // And the newly-minted permanent row must exist with expires_at = NULL.
+        let permanent = DeploymentTokenEntity::find()
+            .filter(temps_entities::deployment_tokens::Column::ProjectId.eq(project.id))
+            .filter(temps_entities::deployment_tokens::Column::ExpiresAt.is_null())
+            .one(service.db.as_ref())
+            .await
+            .unwrap()
+            .expect("get_or_create should have created a permanent token");
+        assert!(permanent.name.starts_with("Auto-generated"));
+    }
+
+    /// Happy-path test: when a permanent token already exists for the
+    /// project, `get_or_create_deployment_token` reuses it instead of
+    /// minting a new one. Without this, every redeploy of every app would
+    /// orphan the previous deployment's token.
+    #[tokio::test]
+    async fn test_get_or_create_reuses_permanent_token() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        // First call: no token exists, so this creates a permanent one.
+        let first = service
+            .get_or_create_deployment_token(project.id, None, None)
+            .await
+            .unwrap();
+
+        // Second call: must return the SAME plaintext.
+        let second = service
+            .get_or_create_deployment_token(project.id, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "get_or_create should reuse the existing permanent token"
+        );
+    }
+
+    // ── Security: run token revocation ────────────────────────────────────────
+
+    /// After `revoke_token_by_id` is called, `validate_token` must reject
+    /// the same token — verifying that immediate revocation works end-to-end.
+    ///
+    /// This is the integration test required for security fix #2:
+    /// run-scoped tokens are now revoked at run completion so the remaining
+    /// expiry window cannot be abused.
+    #[tokio::test]
+    async fn test_revoke_token_by_id_makes_token_invalid() {
+        let Some((_db, service, project)) = setup_test_env().await else {
+            return;
+        };
+
+        // Mint a run-scoped token exactly as the executor does.
+        let created = service
+            .create_token(
+                project.id,
+                None,
+                CreateDeploymentTokenRequest {
+                    name: "workflow-run-test-agent-1".to_string(),
+                    environment_id: None,
+                    deployment_id: None,
+                    // FullAccess ("*") as issued by the executor.
+                    permissions: Some(vec!["*".to_string()]),
+                    expires_at: Some(Utc::now() + Duration::seconds(720)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Token must be valid immediately after creation.
+        assert!(
+            service.validate_token(&created.token).await.is_ok(),
+            "token must validate before revocation"
+        );
+
+        // The executor-issued token must NOT use plain wildcard as its sole
+        // protection — verify the permissions field is ["*"] (FullAccess) as
+        // expected by the current implementation.
+        let perms = created.permissions.as_deref().unwrap_or(&[]);
+        assert_eq!(
+            perms,
+            &["*".to_string()],
+            "run token must carry FullAccess permission"
+        );
+
+        // Revoke the token by its database ID.
+        service.revoke_token_by_id(created.id).await.unwrap();
+
+        // After revocation, validate_token must return Unauthorized.
+        let result = service.validate_token(&created.token).await;
+        assert!(result.is_err(), "token must be rejected after revocation");
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                DeploymentTokenServiceError::Unauthorized(_)
+            ),
+            "rejection must be Unauthorized, not a database error"
+        );
+    }
+
+    /// `revoke_token_by_id` on a non-existent token must silently succeed —
+    /// the executor cleanup path must not fail a completed run because the
+    /// token was already cleaned up.
+    #[tokio::test]
+    async fn test_revoke_token_by_id_nonexistent_is_noop() {
+        let Some((_db, service, _project)) = setup_test_env().await else {
+            return;
+        };
+
+        let result = service.revoke_token_by_id(99999).await;
+        assert!(
+            result.is_ok(),
+            "revoking a non-existent token must not return an error"
+        );
     }
 }

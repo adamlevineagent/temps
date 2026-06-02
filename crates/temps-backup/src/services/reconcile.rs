@@ -1,65 +1,88 @@
-//! Startup reconciliation for orphaned `running` backup rows.
+//! Reconciliation for orphaned `running` backup rows at server boot.
 //!
-//! When the temps process restarts mid-backup, the heartbeat task dies
-//! with it. Without intervention the `backups` row stays in
-//! `state="running"` forever — the UI shows it as "Running" forever, and
-//! the row never gets a final size. On startup we sweep both
-//! `backups` and `external_service_backups`, mark every row that's still
-//! in `running` as `failed` with a recognizable error message, and stamp
-//! `finished_at`. Operators can then re-run the backup if they need to.
+//! When the temps process restarts mid-backup, the in-process task that
+//! was driving the engine dies with it. Without intervention the
+//! `backups` row stays in `state="running"` forever — the UI shows it as
+//! "Running" forever, and the row never gets a final size.
 //!
-//! We do this once at boot only. Any future heartbeat-stall detection
-//! during runtime would be its own scheduled job — out of scope here.
+//! On boot we mark every `running` row in `backups` and
+//! `external_service_backups` as `failed`, stamping `finished_at` from
+//! `started_at + grace`. That's safe because the runtime is the source
+//! of truth: anything the DB thinks is running but isn't in the new
+//! process's executor map is definitively dead.
+//!
+//! No mid-run "stalled" sweep. The temps process during a backup is
+//! parked awaiting Docker/S3 I/O — its liveness has zero correlation
+//! with the actual backup's progress, so process-side heartbeats are
+//! theater. The wall-clock `max_runtime_secs` timeout in
+//! `BackupExecutor` covers the case where a backup genuinely hangs.
 
+use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use tracing::{error, info};
 
-const ORPHAN_REASON: &str =
-    "Backup was in progress when the temps server restarted. The worker process died before \
-     the backup could complete. Re-run the backup if needed.";
+/// Grace period added to `started_at` when stamping `finished_at` on a
+/// reconciled row. Small enough that the displayed duration isn't
+/// literally zero, but not enough to be misleading.
+const ORPHAN_GRACE: chrono::Duration = chrono::Duration::seconds(30);
 
-/// Mark every `backups` and `external_service_backups` row currently in
-/// `state='running'` as `state='failed'`. Logs how many rows were
-/// reconciled. Failures to update individual rows are logged but don't
-/// abort the sweep.
-///
-/// Idempotent: rows already in `failed` / `completed` are untouched.
+/// Sweep at boot. Marks every `running` row as `failed`.
 pub async fn reconcile_orphan_backups(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> {
-    let now = chrono::Utc::now();
+    let (parent_count, ext_count) = fail_running_backups(db).await?;
 
-    // Parent backups rows.
-    let orphans = temps_entities::backups::Entity::find()
+    if parent_count > 0 || ext_count > 0 {
+        info!(
+            parent_count,
+            ext_count,
+            "Backup startup reconciliation: marked rows as failed (orphaned by previous process restart)"
+        );
+    } else {
+        info!("Backup startup reconciliation: no orphaned rows found");
+    }
+    Ok(())
+}
+
+async fn fail_running_backups(db: &DatabaseConnection) -> Result<(usize, usize), sea_orm::DbErr> {
+    let now = Utc::now();
+
+    // ---- Parent `backups` ----------------------------------------------
+    let candidates = temps_entities::backups::Entity::find()
         .filter(temps_entities::backups::Column::State.eq("running"))
         .all(db)
         .await?;
 
     let mut parent_count = 0usize;
-    for orphan in orphans {
-        let id = orphan.id;
-        let mut update: temps_entities::backups::ActiveModel = orphan.into();
+    for row in candidates {
+        let id = row.id;
+        let finished_at = (row.started_at + ORPHAN_GRACE).min(now);
+        let message = build_message(row.started_at, finished_at);
+
+        let mut update: temps_entities::backups::ActiveModel = row.into();
         update.state = Set("failed".to_string());
-        update.error_message = Set(Some(ORPHAN_REASON.to_string()));
-        update.finished_at = Set(Some(now));
+        update.error_message = Set(Some(message));
+        update.finished_at = Set(Some(finished_at));
         match update.update(db).await {
             Ok(_) => parent_count += 1,
             Err(e) => error!("Failed to reconcile orphan backup row {}: {}", id, e),
         }
     }
 
-    // External-service backup rows. These can also stick on `running`
-    // (the engine writes them, and the same crash leaves them orphaned).
-    let ext_orphans = temps_entities::external_service_backups::Entity::find()
+    // ---- Child `external_service_backups` ------------------------------
+    let ext_candidates = temps_entities::external_service_backups::Entity::find()
         .filter(temps_entities::external_service_backups::Column::State.eq("running"))
         .all(db)
         .await?;
 
     let mut ext_count = 0usize;
-    for orphan in ext_orphans {
-        let id = orphan.id;
-        let mut update: temps_entities::external_service_backups::ActiveModel = orphan.into();
+    for row in ext_candidates {
+        let id = row.id;
+        let finished_at = (row.started_at + ORPHAN_GRACE).min(now);
+        let message = build_message(row.started_at, finished_at);
+
+        let mut update: temps_entities::external_service_backups::ActiveModel = row.into();
         update.state = Set("failed".to_string());
-        update.error_message = Set(Some(ORPHAN_REASON.to_string()));
-        update.finished_at = Set(Some(now));
+        update.error_message = Set(Some(message));
+        update.finished_at = Set(Some(finished_at));
         match update.update(db).await {
             Ok(_) => ext_count += 1,
             Err(e) => error!(
@@ -69,17 +92,17 @@ pub async fn reconcile_orphan_backups(db: &DatabaseConnection) -> Result<(), sea
         }
     }
 
-    if parent_count > 0 || ext_count > 0 {
-        info!(
-            "Backup startup reconciliation: marked {} parent + {} external-service \
-             rows as failed (orphaned by previous process restart)",
-            parent_count, ext_count
-        );
-    } else {
-        info!("Backup startup reconciliation: no orphaned rows found");
-    }
+    Ok((parent_count, ext_count))
+}
 
-    Ok(())
+fn build_message(started_at: chrono::DateTime<Utc>, finished_at: chrono::DateTime<Utc>) -> String {
+    format!(
+        "The temps server was restarted while this backup was running. \
+         The backup runner will not resume it automatically — please re-trigger the backup. \
+         (started {}, marked failed at {})",
+        started_at.to_rfc3339(),
+        finished_at.to_rfc3339(),
+    )
 }
 
 #[cfg(test)]
@@ -93,9 +116,10 @@ mod tests {
             name: format!("backup-{}", id),
             backup_id: format!("uuid-{}", id),
             schedule_id: None,
+            schedule_run_id: None,
             backup_type: "full".into(),
             state: "running".into(),
-            started_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            started_at: Utc::now() - chrono::Duration::hours(2),
             finished_at: None,
             size_bytes: None,
             file_count: None,
@@ -108,7 +132,6 @@ mod tests {
             created_by: 1,
             expires_at: None,
             tags: "[]".into(),
-            last_heartbeat_at: None,
         }
     }
 
@@ -119,7 +142,7 @@ mod tests {
             backup_id: 1,
             backup_type: "full".into(),
             state: "running".into(),
-            started_at: chrono::Utc::now() - chrono::Duration::hours(2),
+            started_at: Utc::now() - chrono::Duration::hours(2),
             finished_at: None,
             size_bytes: None,
             s3_location: String::new(),
@@ -132,14 +155,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_message_includes_started_at() {
+        let started = Utc::now() - chrono::Duration::hours(1);
+        let finished = started + ORPHAN_GRACE;
+        let msg = build_message(started, finished);
+        assert!(msg.contains("restarted"));
+        assert!(msg.contains(&started.to_rfc3339()));
+    }
+
     #[tokio::test]
     async fn reconcile_marks_running_rows_as_failed() {
-        // Mock: SELECT running backups → [row 7], SELECT running ext → [row 11].
-        // Each UPDATE returns success.
         let row = running_backup(7);
         let ext_row = running_external_backup(11);
-        // After update, the row is re-read by Sea-ORM in some flows; we
-        // include the row again as a defensive query result.
         let updated_row = temps_entities::backups::Model {
             state: "failed".into(),
             ..row.clone()

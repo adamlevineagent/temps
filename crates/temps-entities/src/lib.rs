@@ -18,6 +18,8 @@ pub mod audit_logs;
 pub mod autopilot_configs;
 pub mod autopilot_run_logs;
 pub mod autopilot_runs;
+pub mod backup_alerts;
+pub mod backup_schedule_services;
 pub mod backup_schedules;
 pub mod backups;
 pub mod challenge_sessions;
@@ -61,6 +63,9 @@ pub mod notification_preferences;
 pub mod notification_providers;
 pub mod notifications;
 pub mod oauth_states;
+pub mod oidc_login_states;
+pub mod oidc_providers;
+pub mod oidc_role_mappings;
 pub mod performance_metrics;
 pub mod postgres_major_upgrades;
 pub mod preset;
@@ -73,6 +78,7 @@ pub mod request_sessions;
 pub mod restore_runs;
 pub mod roles;
 pub mod s3_sources;
+pub mod schedule_runs;
 pub mod secret_environments;
 pub mod secrets;
 pub mod service_endpoints;
@@ -111,6 +117,9 @@ pub mod status_incident_updates;
 pub mod status_incidents;
 pub mod status_monitors;
 
+// Metrics alert rules
+pub mod monitoring_alert_rules;
+
 // Webhook entities
 pub mod webhook_deliveries;
 pub mod webhooks;
@@ -131,10 +140,6 @@ pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
 pub mod sandboxes;
-
-// Workspace entities
-pub mod workspace_messages;
-pub mod workspace_sessions;
 
 // Workflow memory
 pub mod workflow_memory;

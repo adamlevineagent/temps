@@ -37,7 +37,7 @@ impl DockerClient for DefaultDockerClient {
         use bollard::Docker;
         use std::collections::HashMap;
 
-        let docker = Docker::connect_with_unix_defaults()
+        let docker = Docker::connect_with_defaults()
             .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
 
         // Only prune images older than 7 days (168 hours)
@@ -53,7 +53,11 @@ impl DockerClient for DefaultDockerClient {
         match docker.prune_images(Some(options)).await {
             Ok(result) => {
                 let space_mb = result.space_reclaimed.unwrap_or(0) / (1024 * 1024);
-                let count = result.images_deleted.map(|v| v.len()).unwrap_or(0) as u64;
+                let count = result
+                    .images_deleted
+                    .as_ref()
+                    .map(std::vec::Vec::len)
+                    .unwrap_or(0) as u64;
                 Ok(PruneStats {
                     images_deleted: count,
                     space_reclaimed_mb: space_mb as u64,
@@ -68,7 +72,7 @@ impl DockerClient for DefaultDockerClient {
         use bollard::Docker;
         use std::collections::HashMap;
 
-        let docker = Docker::connect_with_unix_defaults()
+        let docker = Docker::connect_with_defaults()
             .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
 
         // Calculate duration filter (e.g., "168h" for 7 days)
@@ -85,7 +89,11 @@ impl DockerClient for DefaultDockerClient {
         match docker.prune_build(Some(options)).await {
             Ok(result) => {
                 let space_mb = result.space_reclaimed.unwrap_or(0) / (1024 * 1024);
-                let caches_deleted = result.caches_deleted.map(|v| v.len()).unwrap_or(0);
+                let caches_deleted = result
+                    .caches_deleted
+                    .as_ref()
+                    .map(std::vec::Vec::len)
+                    .unwrap_or(0);
 
                 if caches_deleted > 0 || space_mb > 0 {
                     Ok(format!(

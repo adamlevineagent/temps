@@ -40,6 +40,7 @@ import {
   History,
   Home,
   Key,
+  KeyRound,
   Mail,
   Monitor,
   Network,
@@ -136,6 +137,18 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['team', 'members', 'people', 'accounts'],
   },
   {
+    title: 'Authentication',
+    url: '/settings/auth',
+    icon: KeyRound,
+    keywords: ['sso', 'oidc', 'openid', 'identity', 'login', 'saml'],
+  },
+  {
+    title: 'Add SSO Provider',
+    url: '/settings/auth/new',
+    icon: KeyRound,
+    keywords: ['sso', 'oidc', 'create', 'connect', 'okta', 'auth0', 'keycloak'],
+  },
+  {
     title: 'API Keys',
     url: '/settings/keys',
     icon: Key,
@@ -149,10 +162,10 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['dns', 'urls', 'websites', 'custom domain'],
   },
   {
-    title: 'Storage',
+    title: 'Databases',
     url: '/storage',
     icon: Database,
-    keywords: ['database', 'files', 'data', 'services'],
+    keywords: ['database', 'databases', 'storage', 'files', 'data', 'services'],
   },
   {
     title: 'Email',
@@ -369,10 +382,10 @@ const projectNavItems: NavigationItem[] = [
     keywords: ['setup', 'configuration', 'install', 'analytics'],
   },
   {
-    title: 'Storage',
+    title: 'Databases',
     url: 'storage',
     icon: Database,
-    keywords: ['database', 'storage', 'data'],
+    keywords: ['database', 'databases', 'storage', 'data'],
   },
   {
     title: 'Logs',

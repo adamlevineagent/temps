@@ -1,4 +1,8 @@
 import {
+  useConsoleExtensions,
+  type ConsoleNavItem,
+} from '@temps-sdk/console-kit'
+import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
@@ -55,7 +59,6 @@ import {
   ShieldAlert,
   SlidersHorizontal,
   Sparkles,
-  TerminalSquare,
   Users,
   Wand2,
   Webhook,
@@ -156,6 +159,7 @@ const settingsGroups: SettingsGroupDef[] = [
     label: 'Access',
     items: [
       { title: 'Users', url: '/settings/users', icon: Users },
+      { title: 'Authentication', url: '/settings/auth', icon: KeyRound },
       { title: 'API Keys', url: '/settings/keys', icon: Key },
     ],
   },
@@ -164,6 +168,7 @@ const settingsGroups: SettingsGroupDef[] = [
     items: [
       { title: 'Load Balancer', url: '/settings/load-balancer', icon: Server },
       { title: 'Docker Registry', url: '/settings/docker-registry', icon: Boxes },
+      { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
       { title: 'Worker Nodes', url: '/settings/nodes', icon: Network },
       { title: 'Plugins', url: '/settings/plugins', icon: Puzzle },
     ],
@@ -174,6 +179,7 @@ const settingsGroups: SettingsGroupDef[] = [
       { title: 'Security Headers', url: '/settings/security', icon: Shield },
       { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
       { title: 'Disk Monitoring', url: '/settings/disk-monitoring', icon: HardDrive },
+      { title: 'Metrics Monitoring', url: '/settings/metrics-monitoring', icon: BarChart3 },
     ],
   },
 ]
@@ -282,6 +288,7 @@ export default function AppSidebar() {
   const { isMinimal, isMobile } = useSidebar()
   const { platformNavEntries } = usePluginsContext()
   const location = useLocation()
+  const { logoBadge } = useConsoleExtensions()
 
   // Convert plugin nav entries to sidebar item format
   const pluginItems = useMemo(
@@ -347,7 +354,10 @@ export default function AppSidebar() {
               </div>
               {!compact && (
                 <div className="grid flex-1 text-left text-sm leading-tight">
-                  <span className="truncate font-semibold">Temps</span>
+                  <span className="flex items-center gap-1.5 truncate font-semibold">
+                    Temps
+                    {logoBadge}
+                  </span>
                   <span className="truncate text-xs">
                     {import.meta.env.TEMPS_VERSION}
                   </span>
@@ -460,9 +470,61 @@ function NavSection({
 
 function NavUser() {
   const { user } = useAuth()
-  const { isMobile, isMinimal } = useSidebar()
+  const { isMobile, isMinimal, setOpenMobile } = useSidebar()
   const { logout } = useAuth()
   if (!user) return null
+
+  // Mobile renders inside a Radix Sheet (Dialog) with z-[9999] on the
+  // overlay. A nested DropdownMenu portals to body and inherits z-50,
+  // so the menu pops up behind the sheet and is invisible/unclickable.
+  // Skip the dropdown on mobile: tap the row → /account directly,
+  // with Log out as a sibling icon button so it's still one tap.
+  // The desktop dropdown is unchanged.
+  if (isMobile) {
+    return (
+      <SidebarMenu>
+        <SidebarMenuItem>
+          <div className="flex items-center gap-1">
+            <SidebarMenuButton
+              size="lg"
+              asChild
+              className="flex-1"
+              onClick={() => setOpenMobile(false)}
+            >
+              <Link to="/account" aria-label="Open account settings">
+                <Avatar className="h-8 w-8 rounded-lg">
+                  <AvatarImage
+                    src={user.avatar_url || ''}
+                    alt={user.username || ''}
+                  />
+                  <AvatarFallback className="rounded-lg">
+                    {user.username?.slice(0, 2).toUpperCase() || 'U'}
+                  </AvatarFallback>
+                </Avatar>
+                <div className="grid min-w-0 flex-1 text-left text-sm leading-tight">
+                  <span className="truncate font-semibold">
+                    {user.username || 'User'}
+                  </span>
+                  <span className="truncate text-xs">{user.email}</span>
+                </div>
+              </Link>
+            </SidebarMenuButton>
+            <button
+              type="button"
+              onClick={async () => {
+                await logout()
+              }}
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+              aria-label="Log out"
+              title="Log out"
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          </div>
+        </SidebarMenuItem>
+      </SidebarMenu>
+    )
+  }
 
   return (
     <SidebarMenu>
@@ -482,7 +544,7 @@ function NavUser() {
                   {user.username?.slice(0, 2).toUpperCase() || 'U'}
                 </AvatarFallback>
               </Avatar>
-              {(!isMinimal || isMobile) && (
+              {!isMinimal && (
                 <div className="grid flex-1 text-left text-sm leading-tight">
                   <span className="truncate font-semibold">
                     {user.username || 'User'}
@@ -495,7 +557,7 @@ function NavUser() {
           </DropdownMenuTrigger>
           <DropdownMenuContent
             className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-lg"
-            side={isMobile ? 'bottom' : 'right'}
+            side="right"
             align="end"
             sideOffset={4}
           >
@@ -558,6 +620,66 @@ interface NavProps {
   onReturnToProject?: () => void
 }
 
+function ExtensionNav({ items }: { items?: ConsoleNavItem[] }) {
+  const location = useLocation()
+  const { isMinimal, isMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+
+  if (!items || items.length === 0) return null
+
+  const sections: string[] = []
+  const bySection = new Map<string, ConsoleNavItem[]>()
+  for (const item of items) {
+    const key = item.section ?? 'Enterprise'
+    if (!bySection.has(key)) {
+      bySection.set(key, [])
+      sections.push(key)
+    }
+    bySection.get(key)!.push(item)
+  }
+
+  return (
+    <>
+      {sections.map((section) => (
+        <SidebarGroup
+          key={section}
+          className={compact ? '' : 'group-data-[collapsible=icon]:hidden'}
+        >
+          <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+            {section}
+          </SidebarGroupLabel>
+          <SidebarMenu>
+            {bySection.get(section)!.map((item) => {
+              const isActive =
+                location.pathname === item.path ||
+                location.pathname.startsWith(item.path + '/')
+              return (
+                <SidebarMenuItem key={item.id}>
+                  <SidebarMenuButton
+                    asChild
+                    tooltip={compact ? item.label : undefined}
+                    className={cn(
+                      'justify-center',
+                      !compact && 'justify-start',
+                      isActive &&
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
+                    )}
+                  >
+                    <Link to={item.path}>
+                      {item.icon}
+                      {!compact && <span>{item.label}</span>}
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )
+            })}
+          </SidebarMenu>
+        </SidebarGroup>
+      ))}
+    </>
+  )
+}
+
 function DefaultNav({
   pluginItems,
   pinnedProjectSlug,
@@ -572,6 +694,7 @@ function DefaultNav({
   // the main "Platform" group at the top.
   const flatItems = navWorkflow.filter((it) => !it.subItems?.length)
   const grouped = navWorkflow.filter((it) => it.subItems?.length)
+  const { navItems: extraNavItems } = useConsoleExtensions()
 
   return (
     <>
@@ -592,6 +715,7 @@ function DefaultNav({
       ))}
       <NavSection label="Observe" items={navObservability} />
       <NavPlugins items={pluginItems} />
+      <ExtensionNav items={extraNavItems} />
       <SidebarGroup className="mt-auto">
         <SidebarMenu>
           <SidebarMenuItem>
@@ -662,11 +786,6 @@ const projectBaseNav: ProjectNavItem[] = [
   { title: 'Overview', url: 'project', icon: Home },
   { title: 'Deployments', url: 'deployments', icon: GitBranch },
   { title: 'Environments', url: 'environments', icon: Layers },
-  { title: 'Databases', url: 'storage', icon: Database },
-  { title: 'Environment Variables', url: 'environment-variables', icon: KeyRound },
-  { title: 'Domains', url: 'domains', icon: Globe },
-  { title: 'Git', url: 'git', icon: GitFork },
-  { title: 'Logs', url: 'runtime', icon: ScrollText },
   {
     title: 'Analytics',
     url: 'analytics',
@@ -682,6 +801,11 @@ const projectBaseNav: ProjectNavItem[] = [
       { title: 'Revenue', url: 'revenue', icon: CreditCard },
     ],
   },
+  { title: 'Databases', url: 'storage', icon: Database },
+  { title: 'Environment Variables', url: 'environment-variables', icon: KeyRound },
+  { title: 'Domains', url: 'domains', icon: Globe },
+  { title: 'Git', url: 'git', icon: GitFork },
+  { title: 'Logs', url: 'runtime', icon: ScrollText },
   {
     title: 'Observe',
     url: 'observe',
@@ -694,19 +818,11 @@ const projectBaseNav: ProjectNavItem[] = [
       { title: 'Traces', url: 'traces', icon: Network },
       { title: 'AI Traces', url: 'ai-gateway?tab=activity', icon: Bot },
       { title: 'Request Logs', url: 'request-logs', icon: Rss },
+      { title: 'AI Crawlers', url: 'ai-crawlers', icon: Bot },
       { title: 'Error Tracking', url: 'errors', icon: ShieldAlert },
     ],
   },
-  {
-    title: 'AI',
-    url: 'agents',
-    icon: Sparkles,
-    navigateOnClick: true,
-    subItems: [
-      { title: 'AI Workflows', url: 'agents', icon: Workflow },
-      { title: 'Workspace', url: 'workspace', icon: TerminalSquare },
-    ],
-  },
+  { title: 'AI Workflows', url: 'agents', icon: Workflow },
   {
     title: 'Settings',
     url: 'settings',

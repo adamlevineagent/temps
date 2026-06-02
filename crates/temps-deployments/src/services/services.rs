@@ -64,6 +64,12 @@ pub enum DeploymentError {
     #[error("Queue error: {0}")]
     QueueError(String),
 
+    /// Bundle path (read from DB and joined to data_dir) resolved outside the
+    /// data directory.  `path` is the offending resolved path; `reason`
+    /// explains how the check failed.
+    #[error("Invalid bundle path '{path}': {reason}")]
+    InvalidBundlePath { path: String, reason: String },
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -908,6 +914,9 @@ impl DeploymentService {
             tag: tag.clone(),
             commit: commit.clone().unwrap_or_default(),
             project_id,
+            target_environment_id: Some(environment_id),
+            // User-initiated trigger — bypasses environments.automatic_deploy.
+            manual_trigger: true,
         };
 
         tracing::debug!(
@@ -2196,18 +2205,17 @@ impl DeploymentService {
 
         // Build the result map
         let mut result = HashMap::new();
-        for (env, project) in environments {
+        for (env, _project) in environments {
             let mut domains = domains_by_env.remove(&env.id).unwrap_or_default();
 
-            // Compute the environment URL using project slug and environment slug
-            let project_slug = project
-                .as_ref()
-                .map(|p| p.slug.as_str())
-                .unwrap_or("unknown");
+            // Build the environment URL from the env's stored `subdomain`
+            // (the canonical hostname source). Reconstructing from project_slug
+            // and env_slug would produce stale URLs after a subdomain rename,
+            // since `environments.subdomain` can be renamed independently.
             let env_url = self
-                .compute_environment_url(project_slug, &env.slug)
+                .compute_environment_url(&env.subdomain)
                 .await
-                .unwrap_or_else(|_| format!("http://{}-{}.localhost", project_slug, env.slug));
+                .unwrap_or_else(|_| format!("http://{}.localhost", env.subdomain));
             domains.insert(0, env_url);
 
             result.insert(
@@ -2269,15 +2277,11 @@ impl DeploymentService {
         Ok(url)
     }
 
-    async fn compute_environment_url(
-        &self,
-        project_slug: &str,
-        environment_slug: &str,
-    ) -> anyhow::Result<String> {
+    async fn compute_environment_url(&self, env_subdomain: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
         let base_domain = settings.preview_domain;
-        let domain = format!("{}-{}.{}", project_slug, environment_slug, base_domain);
+        let domain = format!("{}.{}", env_subdomain, base_domain);
 
         // Determine protocol and port from external_url if set, otherwise default to http
         let (protocol, port) = if let Some(ref url) = settings.external_url {
@@ -2811,6 +2815,10 @@ impl DeploymentService {
             }
         }
 
+        // Snapshot fields we'll need *after* the move into ActiveModel for
+        // the queue event below — the active model takes ownership of the row.
+        let environment_id = deployment.environment_id;
+
         // Update deployment to cancelled state
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.state = Set("cancelled".to_string());
@@ -2818,6 +2826,36 @@ impl DeploymentService {
         active_deployment.finished_at = Set(Some(chrono::Utc::now()));
         active_deployment.updated_at = Set(chrono::Utc::now());
         active_deployment.update(self.db.as_ref()).await?;
+
+        // Publish a DeploymentCancelled event so downstream listeners (PR
+        // commenter, notifications, audit consumers) can react. The workflow
+        // executor publishes the same event when it transitions to Cancelled
+        // mid-pipeline; this site covers user-initiated cancels from the UI /
+        // API, which previously left the PR comment stuck on "Deploying preview".
+        //
+        // Best-effort: a queue failure here must NOT undo the cancellation —
+        // log and move on, mirroring how DeploymentFailed/Succeeded handle it
+        // elsewhere in this file.
+        let environment_name =
+            match temps_entities::environments::Entity::find_by_id(environment_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(env)) => env.name,
+                _ => String::new(),
+            };
+        let event = temps_core::Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {
+            deployment_id,
+            project_id,
+            environment_id,
+            environment_name,
+        });
+        if let Err(e) = self.queue_service.send(event).await {
+            warn!(
+                "Failed to send DeploymentCancelled event for deployment {}: {}",
+                deployment_id, e
+            );
+        }
 
         info!(
             "Successfully cancelled deployment {} for project {} - workflow will stop at next checkpoint",

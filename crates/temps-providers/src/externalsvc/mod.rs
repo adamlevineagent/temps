@@ -11,6 +11,7 @@ pub mod postgres;
 pub mod postgres_cluster;
 pub mod postgres_role_reconciler;
 pub mod postgres_upgrade;
+pub mod postgres_wal_health;
 pub mod redis;
 pub mod rustfs;
 pub mod s3;
@@ -741,6 +742,15 @@ pub trait ExternalService: Send + Sync {
         ))
     }
 
+    /// Restart the service container so that a freshly stored `metrics_ingest_key`
+    /// in the config takes effect as OTLP env vars.
+    ///
+    /// The key is read from `service_config` — callers must persist it first.
+    /// Default is a no-op; only OTLP-push engines (RustFS) override this.
+    async fn apply_ingest_key(&self, _service_config: ServiceConfig) -> Result<()> {
+        Ok(())
+    }
+
     /// Get service type
     fn get_type(&self) -> ServiceType;
 
@@ -808,6 +818,25 @@ pub trait ExternalService: Send + Sync {
         _environment: &str,
     ) -> Result<HashMap<String, String>> {
         Ok(HashMap::new())
+    }
+
+    /// Side-effect-free variant of [`Self::get_runtime_env_vars`] for the UI
+    /// preview path. Same `<project>_<env>` convention, but must not
+    /// provision databases, buckets, or other external resources — the user
+    /// is just looking at what their deployment *would* receive.
+    ///
+    /// Default delegates to `get_runtime_env_vars`. Services with
+    /// provisioning side effects (Postgres `CREATE DATABASE`, S3 bucket
+    /// create, etc.) override this to skip the side effect while still
+    /// returning per-tenant values.
+    async fn preview_runtime_env_vars(
+        &self,
+        config: ServiceConfig,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<HashMap<String, String>> {
+        self.get_runtime_env_vars(config, project_id, environment)
+            .await
     }
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String>;
 

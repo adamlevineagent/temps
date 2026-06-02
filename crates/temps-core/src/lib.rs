@@ -1,5 +1,6 @@
 //! Core utilities and types shared across all Temps crates
 
+pub mod admin_gate;
 pub mod audit;
 pub mod config;
 pub mod deployment;
@@ -53,15 +54,18 @@ pub use anyhow;
 pub use app_settings::{
     AgentSandboxSettings, AiConfigSettings, AppSettings, ContainerLogSettings,
     DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, LetsEncryptSettings,
-    MultiNodeSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
-    ScreenshotSettings, SecurityHeadersSettings,
+    MetricsStoreKind, MonitoringSettings, MultiNodeSettings, PreviewGatewaySettings,
+    ProviderConfig, RateLimitSettings, ScreenshotSettings, SecurityHeadersSettings,
 };
 pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};
 pub use encryption::EncryptionService;
 pub use repo_config::*;
-pub use request_metadata::{host_without_port, RequestMetadata};
+pub use request_metadata::{
+    build_from_request as build_request_metadata, host_without_port, request_metadata_middleware,
+    RequestMetadata, RequestMetadataMiddleware,
+};
 pub use serde;
 pub use serde_json;
 pub use stages::*;
