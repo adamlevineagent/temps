@@ -371,65 +371,14 @@ async fn find_or_create_environment_for_branch(
         return create_preview_environment(db, project, branch_name, &slugified_branch).await;
     }
 
-    // Preview environments not enabled, try to find generic preview environment (legacy behavior)
     info!(
-        "Preview environments not enabled for project {}, looking for generic preview environment",
-        project.id
+        "Preview environments are disabled for project {}; refusing unmatched branch '{}'",
+        project.id, branch_name
     );
-
-    if let Some(preview_env) = environments::Entity::find()
-        .filter(environments::Column::ProjectId.eq(project.id))
-        .filter(environments::Column::Name.eq("preview"))
-        .filter(environments::Column::DeletedAt.is_null())
-        .one(db.as_ref())
-        .await
-        .map_err(|e| format!("Database error finding preview environment: {}", e))?
-    {
-        info!(
-            "Using existing generic preview environment for branch '{}'",
-            branch_name
-        );
-        return Ok(preview_env);
-    }
-
-    // No preview environment exists, create generic one (legacy behavior)
-    info!(
-        "Creating generic preview environment for project {}",
-        project.id
-    );
-
-    use chrono::Utc;
-    use temps_entities::upstream_config::UpstreamList;
-
-    let preview_env = environments::ActiveModel {
-        name: Set("preview".to_string()),
-        slug: Set("preview".to_string()),
-        subdomain: Set(format!("{}-preview", project.slug)),
-        host: Set(String::new()),
-        branch: Set(None), // No specific branch - matches all unmatched branches
-        project_id: Set(project.id),
-        upstreams: Set(UpstreamList::default()),
-        deployment_config: Set(None), // Inherits from project
-        current_deployment_id: Set(None),
-        last_deployment: Set(None),
-        is_preview: Set(false), // Legacy generic preview, not a per-branch preview
-        created_at: Set(Utc::now()),
-        updated_at: Set(Utc::now()),
-        deleted_at: Set(None),
-        ..Default::default()
-    };
-
-    let created_env = preview_env
-        .insert(db.as_ref())
-        .await
-        .map_err(|e| format!("Failed to create preview environment: {}", e))?;
-
-    info!(
-        "Created generic preview environment '{}' for project {}",
-        created_env.name, project.id
-    );
-
-    Ok(created_env)
+    Err(format!(
+        "No environment matches branch '{}' and preview environments are disabled for project {}",
+        branch_name, project.id
+    ))
 }
 
 async fn find_explicit_target_environment(
@@ -1802,10 +1751,10 @@ mod tests {
         Ok(())
     }
 
-    /// Test that a branch without a match uses existing preview environment
+    /// Test that a branch without a match does not use a generic preview when previews are disabled
     #[tokio::test]
-    async fn test_find_environment_uses_existing_preview() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_find_environment_ignores_generic_preview_when_disabled(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -1860,20 +1809,27 @@ mod tests {
         let preview_env = preview_env.insert(db.as_ref()).await?;
 
         // Test finding environment for "feature-auth" branch (no exact match)
-        let found_env =
+        let error =
             find_or_create_environment_for_branch(db.clone(), &project, Some("feature-auth"))
-                .await?;
+                .await
+                .expect_err("preview-disabled projects must not use generic preview envs");
 
-        assert_eq!(found_env.id, preview_env.id);
-        assert_eq!(found_env.name, "preview");
-        assert_eq!(found_env.branch, None); // Preview has no specific branch
+        assert!(error.contains("preview environments are disabled"));
+
+        let persisted_preview = temps_entities::environments::Entity::find_by_id(preview_env.id)
+            .one(db.as_ref())
+            .await?;
+        assert!(
+            persisted_preview.is_some(),
+            "existing preview fixture remains untouched"
+        );
 
         Ok(())
     }
 
-    /// Test that preview environment is auto-created when it doesn't exist
+    /// Test that unmatched branches do not auto-create previews when previews are disabled
     #[tokio::test]
-    async fn test_find_environment_creates_preview_when_missing(
+    async fn test_find_environment_errors_when_preview_disabled(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
@@ -1921,18 +1877,12 @@ mod tests {
             .await?;
         assert!(preview_before.is_none(), "Preview should not exist yet");
 
-        // Test finding environment for "feature-xyz" branch (should create preview)
-        let found_env =
+        // Test finding environment for "feature-xyz" branch (should fail closed)
+        let error =
             find_or_create_environment_for_branch(db.clone(), &project, Some("feature-xyz"))
-                .await?;
-
-        // Verify preview environment was created
-        assert_eq!(found_env.name, "preview");
-        assert_eq!(found_env.slug, "preview");
-        assert_eq!(found_env.subdomain, "auto-create-preview-test-preview");
-        assert_eq!(found_env.host, "");
-        assert_eq!(found_env.branch, None); // No specific branch
-        assert_eq!(found_env.project_id, project.id);
+                .await
+                .expect_err("preview-disabled projects must not auto-create preview envs");
+        assert!(error.contains("preview environments are disabled"));
 
         // Verify preview environment persisted in database
         let preview_after = temps_entities::environments::Entity::find()
@@ -1940,14 +1890,17 @@ mod tests {
             .filter(temps_entities::environments::Column::Name.eq("preview"))
             .one(db.as_ref())
             .await?;
-        assert!(preview_after.is_some(), "Preview should exist now");
+        assert!(
+            preview_after.is_none(),
+            "Preview should not be created when previews are disabled"
+        );
 
         Ok(())
     }
 
-    /// Test that multiple branches without matches all use the same preview environment
+    /// Test that multiple unmatched branches fail closed when previews are disabled
     #[tokio::test]
-    async fn test_multiple_branches_share_preview_environment(
+    async fn test_multiple_unmatched_branches_error_when_preview_disabled(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
@@ -1987,27 +1940,14 @@ mod tests {
         };
         let _production_env = _production_env.insert(db.as_ref()).await?;
 
-        // Find environment for first feature branch (creates preview)
-        let env1 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-auth"))
-                .await?;
+        for branch in ["feature-auth", "feature-payments", "bugfix-login"] {
+            let error = find_or_create_environment_for_branch(db.clone(), &project, Some(branch))
+                .await
+                .expect_err("preview-disabled projects must not route unmatched branches");
+            assert!(error.contains("preview environments are disabled"));
+        }
 
-        // Find environment for second feature branch (reuses preview)
-        let env2 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-payments"))
-                .await?;
-
-        // Find environment for third feature branch (reuses preview)
-        let env3 =
-            find_or_create_environment_for_branch(db.clone(), &project, Some("bugfix-login"))
-                .await?;
-
-        // All three should return the same preview environment
-        assert_eq!(env1.id, env2.id);
-        assert_eq!(env2.id, env3.id);
-        assert_eq!(env1.name, "preview");
-
-        // Verify only one preview environment was created
+        // Verify no preview environment was created
         let all_preview_envs = temps_entities::environments::Entity::find()
             .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
             .filter(temps_entities::environments::Column::Name.eq("preview"))
@@ -2015,8 +1955,8 @@ mod tests {
             .await?;
         assert_eq!(
             all_preview_envs.len(),
-            1,
-            "Should only have one preview environment"
+            0,
+            "Should not create preview environments when previews are disabled"
         );
 
         Ok(())
@@ -2146,19 +2086,16 @@ mod tests {
         };
         let _production_env = _production_env.insert(db.as_ref()).await?;
 
-        // Test finding environment for feature branch
-        // Should create NEW preview (ignore deleted one)
-        let found_env =
+        // Test finding environment for feature branch.
+        // Should ignore deleted preview and fail closed because previews are disabled.
+        let error =
             find_or_create_environment_for_branch(db.clone(), &project, Some("feature-test"))
-                .await?;
+                .await
+                .expect_err("preview-disabled projects must not recreate deleted preview envs");
 
-        assert_eq!(found_env.name, "preview");
-        assert!(
-            found_env.deleted_at.is_none(),
-            "Preview should not be deleted"
-        );
+        assert!(error.contains("preview environments are disabled"));
 
-        // Verify two preview environments exist (one deleted, one active)
+        // Verify only the original deleted preview environment exists
         let all_preview_envs = temps_entities::environments::Entity::find()
             .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
             .filter(temps_entities::environments::Column::Name.eq("preview"))
@@ -2166,8 +2103,8 @@ mod tests {
             .await?;
         assert_eq!(
             all_preview_envs.len(),
-            2,
-            "Should have two preview environments (one deleted, one active)"
+            1,
+            "Should not create a new preview environment when previews are disabled"
         );
 
         Ok(())

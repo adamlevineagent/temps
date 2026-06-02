@@ -21,6 +21,19 @@ use thiserror::Error;
 
 use super::types::{SecretEnvironmentRef, SecretWithEnvironments};
 
+fn environment_ids_with_previews(
+    environment_ids: Vec<i32>,
+    preview_envs: Vec<environments::Model>,
+) -> Vec<i32> {
+    let mut final_environment_ids = environment_ids;
+    for env in preview_envs {
+        if !final_environment_ids.contains(&env.id) {
+            final_environment_ids.push(env.id);
+        }
+    }
+    final_environment_ids
+}
+
 /// Maximum plaintext size for a single secret, in bytes. Matches the
 /// per-container tmpfs budget set in the deployer.
 pub const SECRET_VALUE_MAX_BYTES: usize = 1_048_576; // 1 MiB
@@ -269,8 +282,21 @@ impl SecretService {
                     };
                     let row = new_row.insert(txn).await?;
 
+                    let final_environment_ids = if include_in_preview {
+                        let preview_envs = environments::Entity::find()
+                            .filter(environments::Column::ProjectId.eq(project_id))
+                            .filter(environments::Column::IsPreview.eq(true))
+                            .filter(environments::Column::DeletedAt.is_null())
+                            .all(txn)
+                            .await?;
+
+                        environment_ids_with_previews(environment_ids.clone(), preview_envs)
+                    } else {
+                        environment_ids.clone()
+                    };
+
                     let mut envs = Vec::new();
-                    for env_id in &environment_ids {
+                    for env_id in &final_environment_ids {
                         let env = environments::Entity::find_by_id(*env_id)
                             .one(txn)
                             .await?
@@ -383,8 +409,21 @@ impl SecretService {
                         .exec(txn)
                         .await?;
 
+                    let final_environment_ids = if include_in_preview {
+                        let preview_envs = environments::Entity::find()
+                            .filter(environments::Column::ProjectId.eq(project_id))
+                            .filter(environments::Column::IsPreview.eq(true))
+                            .filter(environments::Column::DeletedAt.is_null())
+                            .all(txn)
+                            .await?;
+
+                        environment_ids_with_previews(environment_ids.clone(), preview_envs)
+                    } else {
+                        environment_ids.clone()
+                    };
+
                     let mut envs = Vec::new();
-                    for env_id in &environment_ids {
+                    for env_id in &final_environment_ids {
                         let env = environments::Entity::find_by_id(*env_id)
                             .one(txn)
                             .await?
@@ -536,6 +575,42 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    fn make_environment_model(id: i32, project_id: i32, is_preview: bool) -> environments::Model {
+        environments::Model {
+            id,
+            name: format!("env-{}", id),
+            slug: format!("env-{}", id),
+            subdomain: format!("env-{}.example.com", id),
+            last_deployment: None,
+            host: String::new(),
+            upstreams: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            project_id,
+            current_deployment_id: None,
+            branch: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview,
+            protected: false,
+            sleeping: false,
+            last_activity_at: None,
+        }
+    }
+
+    #[test]
+    fn test_environment_ids_with_previews_backfills_existing_preview_envs() {
+        let ids = environment_ids_with_previews(
+            vec![1, 2],
+            vec![
+                make_environment_model(2, 10, true),
+                make_environment_model(3, 10, true),
+            ],
+        );
+
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]
