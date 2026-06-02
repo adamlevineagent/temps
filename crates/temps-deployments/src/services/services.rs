@@ -914,6 +914,7 @@ impl DeploymentService {
             tag: tag.clone(),
             commit: commit.clone().unwrap_or_default(),
             project_id,
+            target_environment_id: Some(environment_id),
             // User-initiated trigger — bypasses environments.automatic_deploy.
             manual_trigger: true,
         };

@@ -9,6 +9,10 @@ pub struct GitPushEventJob {
     pub tag: Option<String>,
     pub commit: String,
     pub project_id: i32,
+    /// Explicit deployment target for user-initiated deploys. Webhook jobs leave
+    /// this unset so they continue to route by branch/preview rules.
+    #[serde(default)]
+    pub target_environment_id: Option<i32>,
     /// True when this event came from an explicit user action (the
     /// "Deploy" button or `trigger_pipeline` API call), false when it
     /// came from a git provider webhook. Manual triggers bypass the

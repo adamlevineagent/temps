@@ -4051,6 +4051,7 @@ impl GitProviderManager {
                 tag: tag.clone(),
                 commit: commit.clone(),
                 project_id: project.id,
+                target_environment_id: None,
                 // Real git provider webhook — honour automatic_deploy.
                 manual_trigger: false,
             };

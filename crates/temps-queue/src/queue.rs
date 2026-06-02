@@ -584,6 +584,7 @@ mod tests {
             tag: None,
             commit: "abc123def456".to_string(),
             project_id: 123,
+            target_environment_id: None,
             manual_trigger: false,
         };
 
@@ -739,6 +740,7 @@ mod tests {
             tag: None,
             commit: "abc123".to_string(),
             project_id: 123,
+            target_environment_id: None,
             manual_trigger: false,
         });
 
