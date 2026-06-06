@@ -621,22 +621,44 @@ async fn process_git_push_event(
         }
     };
 
+    let pushed_branch = match job.branch.as_deref() {
+        Some(branch) => branch,
+        None => {
+            info!(
+                "Skipping push event for project {}: push has no branch ref (tag: {:?})",
+                project.id, job.tag
+            );
+            return;
+        }
+    };
+
+    if pushed_branch != project.main_branch {
+        info!(
+            "Skipping non-production push event for project {} branch '{}' (production branch '{}')",
+            project.id, pushed_branch, project.main_branch
+        );
+        return;
+    }
+
     // Find environment matching the branch, or fallback to preview environment.
     // Multiple environments can track the same branch, but auto-deploy only
     // targets the first match. Users promote to other environments via redeploy.
-    let environment =
-        match find_or_create_environment_for_branch(db.clone(), &project, job.branch.as_deref())
-            .await
-        {
-            Ok(env) => env,
-            Err(e) => {
-                error!(
-                    "Failed to find or create environment for project {}: {}",
-                    project.id, e
-                );
-                return;
-            }
-        };
+    let environment = match find_or_create_environment_for_branch(
+        db.clone(),
+        &project,
+        Some(pushed_branch),
+    )
+    .await
+    {
+        Ok(env) => env,
+        Err(e) => {
+            error!(
+                "Failed to find or create environment for project {}: {}",
+                project.id, e
+            );
+            return;
+        }
+    };
 
     // ── Auto-deploy gate ─────────────────────────────────────────────────
     //
